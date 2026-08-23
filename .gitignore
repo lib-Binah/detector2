@@ -1,0 +1,56 @@
+# 本地视频（light_test 从 Video/ 读 .avi，不入库）
+/Video/
+*.avi
+*.mp4
+*.mkv
+*.mov
+
+# CLion / CMake 构建目录
+build/
+cmake-build-*/
+out/
+Debug/
+Release/
+.cache/
+
+# 编译产物
+*.o
+*.obj
+*.d
+*.gch
+*.pch
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.pdb
+light_test
+
+# 源码树内误生成的 CMake 文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+_deps/
+Testing/
+
+# IDE / 编辑器
+.idea/
+*.user
+*.userfiles
+.vscode/
+*.swp
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
+.directory
+.Trash-*
+.nfs*
+.fuse_hidden*
