@@ -15,7 +15,7 @@
  * get_lights 每一步必须逐步注释（get_bin / R>B / findContours / 几何 / RGB / HSV 占比）。
  *
  * 装甲板灯条检测：BGR→灰度阈值分割 + 轮廓几何筛选 + 旋转矩形内 RGB 判色
- * + 对应色 HSV 在旋转矩形内的面积比门限。过曝灯芯在灰度上仍是高亮，单阈值即可接住；
+ * + 对应色 HSV 在旋转矩形内的面积比门限（红/蓝下限分开）。过曝灯芯在灰度上仍是高亮，单阈值即可接住；
  * HSV 只做二次确认，不代替灰度找轮廓。
  */
 
@@ -29,7 +29,7 @@ struct HsvParams {
 struct LightParams {
     // 默认灰度阈值只在这里定一份。成员 gray_thres 不能当 LightParams::gray_thres 用
     //（那是实例字段）；进度条初值请读 kGrayThresDefault。
-    static constexpr int kGrayThresDefault = 113;
+    static constexpr int kGrayThresDefault = 145;
     int gray_thres = kGrayThresDefault;  // 灰度下限，像素 > 该值视为前景；播放时可调
     double min_height_width = 1.5;    // 细长比下限：Light::ratio = height/width
     double max_height_width = 15.0;   // 细长比上限，过瘦噪声丢掉

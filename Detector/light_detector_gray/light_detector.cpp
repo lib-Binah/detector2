@@ -16,7 +16,8 @@
  * 颜色先看 RGB：在旋转矩形内、且落在二值前景上的像素，R>B 计红面积、B>R 计蓝面积，
  * 红面积更大判红，蓝面积更大判蓝。
  * 再按已判颜色做 HSV 二次确认：旋转矩形内 inRange(红=red_params_ / 蓝=blue_params_)
- * 的像素占矩形栅格面积的比例写入 Light::hsv_ratio，须大于 kHsvRatioMin 才保留。
+ * 的像素占矩形栅格面积的比例写入 Light::hsv_ratio；红须大于 kHsvRatioMinRed，
+ * 蓝须大于 kHsvRatioMinBlue 才保留（两色下限分开设）。
  */
 #include "light_detector.h"
 
@@ -26,10 +27,11 @@
 
 namespace {
 
-constexpr int kMinArea = 40;     // 旋转矩形面积下限，滤掉碎点
+constexpr int kMinArea = 20;     // 旋转矩形面积下限，滤掉碎点
 constexpr int kMaxArea = 3500;   // 面积上限，滤掉大块误分割
 const double kMaxAbsAngle = 25.0;  // 右上→右下相对竖直的倾角门限（度）
-constexpr double kHsvRatioMin = 0.4;  // 旋转矩形内对应色 HSV 像素占比下限，须大于此值才是灯条
+constexpr double kHsvRatioMinRed = 0.6;   // 红灯条：旋转矩形内红色 HSV 像素占比下限，须大于此值
+constexpr double kHsvRatioMinBlue = 0.4;  // 蓝灯条：旋转矩形内蓝色 HSV 像素占比下限，须大于此值
 
 }  // namespace
 
@@ -41,9 +43,9 @@ LightDetector::LightDetector() {
     // OpenCV HSV：H∈[0,180]。红在 0 附近（此处只用低 H 段，未包 170–180 环绕）。
     red_params_.h_min = 0;
     red_params_.h_max = 35;
-    red_params_.s_min = 60;
+    red_params_.s_min = 120;
     red_params_.s_max = 255;
-    red_params_.v_min = 120;
+    red_params_.v_min = 90;
     red_params_.v_max = 255;
 
     // 蓝在 H≈80–105（偏青蓝），S 下限较低以兼容过曝发白的蓝灯。
@@ -234,7 +236,10 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         // hsvRatioInRotatedRect：旋转矩形 ∩ 该色 HSV → 占比，写入 Light::hsv_ratio（overlay 同源）。
         const cv::Mat& color_hsv = (light.color == 1) ? red_hsv : blue_hsv;
         light.hsv_ratio = hsvRatioInRotatedRect(color_hsv, light.pts);
-        if (light.hsv_ratio <= kHsvRatioMin)
+        // 红/蓝占比下限分开：color==1 用 kHsvRatioMinRed，否则用 kHsvRatioMinBlue。
+        const double hsv_ratio_min =
+            (light.color == 1) ? kHsvRatioMinRed : kHsvRatioMinBlue;
+        if (light.hsv_ratio <= hsv_ratio_min)
             continue;  // HSV 命中面积不够，RGB 投票过了也不当灯条
 
         valid_lights.push_back(light);
