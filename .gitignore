@@ -28,6 +28,7 @@ Release/
 *.out
 *.pdb
 light_test
+armor_test
 
 # 源码树内误生成的 CMake 文件
 CMakeCache.txt

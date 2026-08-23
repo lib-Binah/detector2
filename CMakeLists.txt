@@ -2,8 +2,9 @@
 # 检测筛选与 overlay 显示必须读 Light 的同一属性或函数（计算方式相同）。
 # 每个函数须写清作用/输入/输出；调用处也要注明调谁、送什么、得到什么。
 #
-# detector2：灰度阈值灯条检测工程（OpenCV + C++20）。
+# detector2：灰度阈值灯条检测 + 装甲板配对（OpenCV + C++20）。
 # 可执行文件 light_test = 几何 Light + LightDetector + 双窗口播放调试。
+# 可执行文件 armor_test = 复用灯条检测（不改其源码）+ ArmorBoard + ArmorDetector + 数字 CNN + PnP。
 
 cmake_minimum_required(VERSION 3.10)
 project(detector2)
@@ -31,3 +32,22 @@ target_include_directories(light_test PRIVATE
 )
 
 target_link_libraries(light_test PRIVATE ${OpenCV_LIBS})
+
+# 装甲板调试：灯条几何/检测源文件只编译进本目标，不修改 light_detector_gray 逻辑。
+add_executable(armor_test
+        Detector/armor_detector/armor_test.cpp
+        Detector/armor_detector/ArmorBoard.cpp
+        Detector/armor_detector/armor_detector.cpp
+        Detector/armor_detector/number_classifier.cpp
+        Detector/light_detector_gray/Light.cpp
+        Detector/light_detector_gray/light_detector.cpp
+)
+
+target_include_directories(armor_test PRIVATE
+        ${OpenCV_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/Detector/light_detector_gray
+        ${CMAKE_CURRENT_SOURCE_DIR}/Detector/armor_detector
+)
+
+target_link_libraries(armor_test PRIVATE ${OpenCV_LIBS})

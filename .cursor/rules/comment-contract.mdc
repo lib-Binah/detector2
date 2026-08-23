@@ -1,6 +1,6 @@
 ---
 description: 禁止删注释；改代码必须同步改注释；函数必须写清作用/输入/输出，调用处也要注明
-globs: Detector/light_detector_gray/**/*.{h,hpp,cpp},CMakeLists.txt
+globs: Detector/light_detector_gray/**/*.{h,hpp,cpp},Detector/armor_detector/**/*.{h,hpp,cpp},CMakeLists.txt
 alwaysApply: true
 ---
 
