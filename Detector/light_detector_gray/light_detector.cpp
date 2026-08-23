@@ -29,7 +29,7 @@ namespace {
 constexpr int kMinArea = 40;     // 旋转矩形面积下限，滤掉碎点
 constexpr int kMaxArea = 3500;   // 面积上限，滤掉大块误分割
 const double kMaxAbsAngle = 25.0;  // 右上→右下相对竖直的倾角门限（度）
-constexpr double kHsvRatioMin = 0.6;  // 旋转矩形内对应色 HSV 像素占比下限，须大于此值才是灯条
+constexpr double kHsvRatioMin = 0.4;  // 旋转矩形内对应色 HSV 像素占比下限，须大于此值才是灯条
 
 }  // namespace
 
@@ -51,7 +51,7 @@ LightDetector::LightDetector() {
     blue_params_.h_max = 105;
     blue_params_.s_min = 20;
     blue_params_.s_max = 255;
-    blue_params_.v_min = 150;
+    blue_params_.v_min = 200;
     blue_params_.v_max = 255;
 }
 
