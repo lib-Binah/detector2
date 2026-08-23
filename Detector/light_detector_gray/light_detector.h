@@ -9,14 +9,19 @@
  * 注释契约（给后续修改者 / 智能体）：
  * 本模块注释说明灯条识别各段的作用与原理。禁止为“精简”删除注释；
  * 改灰度阈值、形态学、几何门限或 RGB 判色时，必须同步修改对应注释。
+ * 几何筛选必须读 Light 的属性或函数（ratio、angle、area() 等），与 overlay
+ * 显示同源、计算方式相同；禁止在本文件里另写一套高宽比。
  *
  * 装甲板灯条检测：BGR→灰度阈值分割 + 轮廓几何筛选 + 旋转矩形内 RGB 判色。
  * 不用 HSV 取色。过曝灯芯在灰度上仍是高亮，单阈值即可接住。
  */
 struct LightParams {
-    int gray_thres = 113;           // 灰度下限，像素 > 该值视为前景；播放时可调
-    int min_height_width = 1.5;       // 细长比下限：高 / 宽（左上→左下 / 左上→右上）
-    int max_height_width = 15;      // 细长比上限，过瘦噪声丢掉
+    // 默认灰度阈值只在这里定一份。成员 gray_thres 不能当 LightParams::gray_thres 用
+    //（那是实例字段）；进度条初值请读 kGrayThresDefault。
+    static constexpr int kGrayThresDefault = 113;
+    int gray_thres = kGrayThresDefault;  // 灰度下限，像素 > 该值视为前景；播放时可调
+    double min_height_width = 1.5;    // 细长比下限：Light::ratio = height/width
+    double max_height_width = 15.0;   // 细长比上限，过瘦噪声丢掉
 };
 
 class LightDetector {

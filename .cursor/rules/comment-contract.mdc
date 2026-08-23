@@ -12,6 +12,7 @@ alwaysApply: true
 2. **改代码必须改注释**。改字段含义、顶点顺序、阈值、掩码、公式、窗口布局或快捷键时，同一提交/同一轮编辑里同步改对应注释。只改代码不改注释视为未完成。
 3. **新增逻辑要写注释**。新阈值、新几何量、新窗口/进度条，用一两句话写清作用与原理。
 4. **注释与代码不一致时，以代码为准并立刻改注释**，不要删注释来“消歧”。
+5. **检测和显示必须同源**。筛灯条用的量（高、宽、细长比、倾角、面积、颜色等）和 overlay / HUD 画出来的量，必须读 `Light` 的**同一个属性或同一个函数**，计算方式相同。禁止检测走 `ratio`、显示另写 `height/width` 或另搞一个 `hw_ratio()`。改公式只改 Light 一处，检测器和播放器一起跟着变。
 
 ## 反例 / 正例
 
@@ -22,4 +23,12 @@ height = cv::norm(pts[0] - pts[2]);
 // ✅ GOOD：保留并在改公式时改注释
 // 高：左上 → 左下。改顶点顺序时必须同步改本句。
 height = cv::norm(pts[0] - pts[2]);
+
+// ❌ BAD：检测和显示各算一遍，数值会对不上
+if (light.ratio < min_ratio) continue;           // 检测读字段
+putText(..., light.height / light.width, ...);   // 显示另算
+
+// ✅ GOOD：两边都读 Light::ratio（构造时写入 height/width）
+if (light.ratio < min_ratio) continue;
+putText(..., light.ratio, ...);
 ```

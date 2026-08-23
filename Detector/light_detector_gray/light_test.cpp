@@ -3,6 +3,8 @@
  * @brief 灰度灯条检测的多窗口播放调试
  *
  * 注释契约：禁止随意删除本文件注释；改窗口布局、HUD 内容、进度条或快捷键时必须改注释。
+ * overlay 画的 H/W/ratio/ang/color 必须读 Light 的同一属性或函数，与检测筛选
+ * 计算方式相同；禁止显示时另写 height/width 或另搞一套细长比。
  *
  * 三个窗口：
  *   displayimg          原图+旋转矩形及可选标注；画面外顶栏左=FPS/整帧灰度均值（带标签），
@@ -45,17 +47,16 @@ constexpr int kHudH = 36;              // 画面外顶栏高度（像素，缩�
 constexpr int kFontThick = 1;          // 鼠标数值和灯条标注统一字粗 1
 constexpr int kMaxWinW = 1920;         // 窗口内容宽上限
 constexpr int kMaxWinH = 1080;         // 窗口内容高上限，含拼接后的组合窗
-constexpr int kGrayThresDefault = 180; // 与 LightParams::gray_thres 默认一致
-
-int gray_thres = kGrayThresDefault;
+// 进度条初值跟检测器默认同源；。
+int gray_thres = LightParams::kGrayThresDefault;
 
 // light overlay 窗的 0/1 进度条：只改 displayimg 上的文字，不改检测。
 // 默认全开，和原先四行都画一致。GTK 进度条下限是 0，所以用 int 而不是 bool。
-int overlay_h = 1;      // 高：左上→左下（Light::height）
-int overlay_w = 1;      // 宽：左上→右上（Light::width）
-int overlay_ratio = 1;  // 细长比 height/width
-int overlay_ang = 1;    // 右上→右下相对竖直夹角（度）
-int overlay_color = 1;  // red / blue / ?
+int overlay_h = 1;      // 显示 Light::height，与检测同一字段
+int overlay_w = 1;      // 显示 Light::width，与检测同一字段
+int overlay_ratio = 1;  // 显示 Light::ratio，禁止另算 height/width
+int overlay_ang = 1;    // 显示 Light::angle，与检测同一字段
+int overlay_color = 1;  // 显示 Light::color（1 red / 2 blue）
 
 /** 只在真正播到新帧时更新，暂停时沿用上次，避免 waitKey 循环把 FPS 打满。 */
 void updateFps(double& fps, bool enabled) {
@@ -177,12 +178,13 @@ void processLights(const Mat& raw, LightDetector& detector, Mat& bin,
 }
 
 /**
- * 主窗口画面内按 overlay_* 开关逐行画（字粗 1，带标签；关掉某一行就上移，不留空行）：
+ * 主窗口画面内按 overlay_* 开关逐行画（字粗 1，带标签；关掉某一行就上移，不留空行）。
+ * 同源契约：下面每一项都读 Light 已有字段，与 light_detector 筛选同一来源、同一公式：
  *   H     = Light::height（左上→左下）
  *   W     = Light::width（左上→右上）
- *   ratio = height / width
+ *   ratio = Light::ratio（构造时 height/width，禁止再写 height/width）
  *   ang   = Light::angle（右上→右下相对竖直，度）
- *   color = red / blue / ?
+ *   color = Light::color（1 red / 2 blue / 其他 ?）
  */
 void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
     const int line_h = 12;
@@ -219,7 +221,7 @@ void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
             y += line_h;
         }
         if (overlay_ratio) {
-            putText(img, cv::format("ratio:%.2f", light.hw_ratio()), Point(org.x, y),
+            putText(img, cv::format("ratio:%.2f", light.ratio), Point(org.x, y),
                     FONT_HERSHEY_PLAIN, 0.9, Scalar(0, 255, 255), kFontThick, LINE_AA);
             y += line_h;
         }
@@ -243,7 +245,7 @@ Mat makeOverlayLegend() {
     Mat panel(72, 440, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "0=hide  1=show   (displayimg only)", Point(8, 20),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
-    putText(panel, "H=TL-BL  W=TL-TR  ratio=H/W", Point(8, 42),
+    putText(panel, "H=TL-BL  W=TL-TR  ratio=Light.ratio", Point(8, 42),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "ang=tilt deg(TR-BR)  color=red/blue", Point(8, 64),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);

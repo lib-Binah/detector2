@@ -1,5 +1,7 @@
 /**
  * 注释契约：禁止随意删除本文件注释；改顶点排序、高宽公式、夹角或绘制颜色时必须改注释。
+ * 高/宽/ratio/angle 只在本构造函数算一次并写入成员；检测筛选和 overlay 必须读这些
+ * 成员（或 area()），禁止各自再算一遍，保证计算方式相同。
  *
  * 灯条几何构造与可视化：minAreaRect → 顶点重排 → 高/宽/倾角 → 画框。
  */
@@ -24,9 +26,10 @@ Light::Light(const std::vector<cv::Point>& contour, int color)
     if (pts[2].x > pts[3].x)
         std::swap(pts[2], pts[3]);
 
-    // 高：左上→左下；宽：左上→右上（短边）。overlay 的 H/W 就显示这两项。
+    // 高：左上→左下；宽：左上→右上（短边）。ratio 当场写入，检测和 overlay 都读它。
     height = cv::norm(pts[0] - pts[2]);
     width = cv::norm(pts[0] - pts[1]);
+    ratio = (width > 1e-6) ? height / width : 0.0;
 
     // 右上→右下边相对竖直的夹角。竖直时 dy 大、angle≈0；
     // atan2(dx, dy) 在 dy≈0（近水平）时得到 ±90°，检测器用 |angle| 门限丢掉。

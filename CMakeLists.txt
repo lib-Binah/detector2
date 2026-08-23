@@ -1,4 +1,5 @@
 # 注释契约：禁止删除本文件注释；增删源文件或改目标名时必须同步改注释。
+# 检测筛选与 overlay 显示必须读 Light 的同一属性或函数（计算方式相同）。
 #
 # detector2：灰度阈值灯条检测工程（OpenCV + C++20）。
 # 可执行文件 light_test = 几何 Light + LightDetector + 双窗口播放调试。

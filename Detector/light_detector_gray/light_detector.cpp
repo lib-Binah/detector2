@@ -3,11 +3,14 @@
  * @brief 灰度阈值灯条检测
  *
  * 注释契约：禁止随意删除本文件注释；改阈值、掩码或筛选条件时必须改注释。
+ * 检测用的高/宽/细长比/倾角/面积必须来自 Light 的同一属性或函数，与 overlay 显示
+ * 计算方式相同；禁止在此另算 height/width 当细长比。
  *
  * 原理概要：
  * 灯条是高亮、近竖直的细长色块。先把 BGR 转灰度，大于 gray_thres 的像素为前景，
- * 闭运算补小缺口，再找外轮廓。用旋转矩形四顶点计算高（左上→左下）、
- * 宽（左上→右上）。细长比用 height/width。倾角用 |angle|（右上→右下相对竖直，度）。
+ * 闭运算补小缺口，再找外轮廓。高/宽/细长比/倾角/面积一律用 Light 构造时写入的字段
+ * 或由其算出的 area()：筛选和 overlay 同一份数据。
+ * 细长比读 Light::ratio（height/width），倾角读 |Light::angle|（度）。
  * 颜色不看 HSV：在旋转矩形内、且落在二值前景上的像素，R>B 计红面积、B>R 计蓝面积，
  * 红面积更大判红，蓝面积更大判蓝。
  */
@@ -108,15 +111,13 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         if (light.height <= 1e-6)
             continue;
 
-        // 细长比 = 高 / 宽。宽已是短边（左上→右上）。
+        // 同源契约：细长比/面积/倾角只读 Light 字段或 area()，与 overlay 同一计算。
         if (light.width <= 1e-6)
             continue;
-        const double ratio = light.ratio;
-        if (ratio < min_ratio || ratio > max_ratio)
+        if (light.ratio < min_ratio || light.ratio > max_ratio)
             continue;
 
-        const float area = light.rotatedRect.size.width * light.rotatedRect.size.height;
-        if (area < kMinArea || area > kMaxArea)
+        if (light.area() < kMinArea || light.area() > kMaxArea)
             continue;
 
         if (std::fabs(light.angle) > kMaxAbsAngle)
