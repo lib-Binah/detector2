@@ -1,10 +1,10 @@
 /**
  * 注释契约：禁止随意删除本文件注释；改端点公式、物点尺寸、内参或绘制颜色时必须改注释。
- * light_ratio / center_distance / angle 只在构造函数算一次并写入成员；
+ * light_ratio / center_distance / angle / light_angle_diff 只在构造函数算一次并写入成员；
  * 配对筛选和 overlay 必须读这些成员，禁止各自再算一遍。
  * 每个函数须写清作用/输入/输出；本文件内的 OpenCV 调用处也要注明。
  *
- * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角 → 画框 → IPPE PnP。
+ * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角/灯条倾角差 → 画框 → IPPE PnP。
  */
 #include "ArmorBoard.h"
 
@@ -47,8 +47,8 @@ cv::Point2f ArmorBoard::bottomOf(const Light& light) {
 }
 
 /**
- * 作用：两灯条填几何；左右按中心 x 排序；三个配对量当场写入。
- * 输入：两根 Light。输出：left/right/端点/center/light_ratio/center_distance/angle。
+ * 作用：两灯条填几何；左右按中心 x 排序；四个配对量当场写入。
+ * 输入：两根 Light。输出：left/right/端点/center/light_ratio/center_distance/angle/light_angle_diff。
  */
 ArmorBoard::ArmorBoard(const Light& a, const Light& b) {
     // 左灯条 = 中心更靠左的那根；后续 PnP 点序依赖这个约定。
@@ -83,6 +83,9 @@ ArmorBoard::ArmorBoard(const Light& a, const Light& b) {
         angle = 90.0;
     else
         angle = std::fabs(std::atan(diff.y / diff.x)) * 180.0 / CV_PI;
+
+    // 两灯条自身倾角差：必须读 Light::angle（与灯条 overlay 的 ang 同源），不要另算一遍。
+    light_angle_diff = std::fabs(left.angle - right.angle);
 }
 
 /**

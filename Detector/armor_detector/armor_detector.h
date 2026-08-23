@@ -13,7 +13,7 @@
  * 注释契约（给后续修改者 / 智能体）：
  * 本模块注释说明装甲板配对各段的作用与原理。禁止为“精简”删除注释；
  * 改颜色过滤、夹灯判定、长度比/中心距/倾角门槛时，必须同步修改对应注释。
- * 几何筛选必须读 ArmorBoard 的属性（light_ratio、center_distance、angle），与 overlay
+ * 几何筛选必须读 ArmorBoard 的属性（light_ratio、center_distance、angle、light_angle_diff），与 overlay
  * 显示同源、计算方式相同；禁止在本文件里另写一套中心距或长度比。
  * 每个函数须写清作用、输入、输出；调用处也要注明调谁、送什么、得到什么。
  * get_armors 每一步必须逐步注释（同色配对 / containLight / isArmor / 数字 / PnP）。
@@ -31,6 +31,8 @@ struct ArmorParams {
     double max_large_center_distance = 5.5;
     // 两灯中心连线相对水平的最大倾角（度）。
     double max_angle = 35.0;
+    // 左右灯条 Light::angle 差的绝对值上限（度）；大于该值不当装甲板。
+    double max_light_angle_diff = 10.0;
     // 0=红蓝都配（同色对），1=只红，2=只蓝。clone_detector 默认锁一色；调试默认都要。
     int detect_color = 0;
     // CNN softmax 门槛：confidence 必须严格大于该值才保留（默认 kMinConfidence=0.80）。播放进度条会改它。
@@ -86,8 +88,8 @@ private:
     bool containLight(const Light& a, const Light& b, const std::vector<Light>& lights) const;
 
     /**
-     * 作用：用已写入的 light_ratio/center_distance/angle 判是否像装甲，并写入 type。
-     * 输入：armor 构造时已算好三个量。输出：true 表示通过门槛。
+     * 作用：用已写入的 light_ratio/center_distance/angle/light_angle_diff 判是否像装甲，并写入 type。
+     * 输入：armor 构造时已算好四个量。输出：true 表示通过门槛。
      */
     bool isArmor(ArmorBoard& armor) const;
 

@@ -22,6 +22,8 @@
  * light_ratio：min(Light::height)/max(Light::height)，构造时写入。
  * center_distance：两灯 Light::center() 距离 / 平均 Light::height（无量纲，远近近似不变）。
  * angle：两中心连线相对水平的倾角（度）。
+ * light_angle_diff：|left.angle - right.angle|，读的就是灯条 Light::angle（右上→右下相对竖直）。
+ * 绝对值大于 max_light_angle_diff（默认 6°）不当装甲板。筛选和 overlay 都读这个字段。
  * 大小板：center_distance 落入小板或大板区间；分界读 min_large_center_distance。
  * PnP 物点：小板 135×55 mm、大板 225×55 mm（灯条矩形，不是整板外扩后的数字面）。
  */
@@ -41,10 +43,11 @@ public:
 
     ArmorType type = ArmorType::SMALL;
 
-    // 下面三个量构造时写一次；配对门槛和 overlay 都读它们。
+    // 下面四个量构造时写一次；配对门槛和 overlay 都读它们。
     double light_ratio = 0.0;       // 短灯高 / 长灯高，读 Light::height
     double center_distance = 0.0;   // 中心距 / 平均 Light::height
     double angle = 0.0;             // 中心连线相对水平的倾角（度）
+    double light_angle_diff = 0.0;  // |Light::angle 左 - Light::angle 右|（度）；>6° 丢掉
 
     int number = 0;                 // 识别标签 1~8；0=未识别 / 拒识
     float confidence = 0.f;         // CNN softmax 最大类概率
@@ -63,9 +66,9 @@ public:
     ArmorBoard() = default;
 
     /**
-     * 作用：由两根灯条填几何（左右按中心 x 排序），并写入 light_ratio/center_distance/angle。
+     * 作用：由两根灯条填几何（左右按中心 x 排序），并写入 light_ratio/center_distance/angle/light_angle_diff。
      * 输入：两根已通过灯条筛选的 Light；不必预先分左右。
-     * 输出：left/right、四端点、center、三个几何量；type/number/PnP 由检测器后写。
+     * 输出：left/right、四端点、center、四个几何量；type/number/PnP 由检测器后写。
      */
     ArmorBoard(const Light& a, const Light& b);
 

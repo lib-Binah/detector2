@@ -3,14 +3,16 @@
  * @brief 灯条 + 装甲板配对 / 数字 CNN / PnP 的播放调试（不改灯条检测源码）
  *
  * 注释契约：禁止随意删除本文件注释；改窗口布局、HUD、进度条或快捷键时必须改注释。
- * overlay 画的 type/lr/cd/ang/num/conf/dist 必须读 ArmorBoard 的同一属性，与配对/分类/PnP
+ * overlay 画的 type/lr/cd/ang/dAng/num/conf/dist 必须读 ArmorBoard 的同一属性，与配对/分类/PnP
  * 计算方式相同；禁止显示时另算中心距或长度比。灯条框仍读 Light 字段。
  * 每个函数须写清作用、输入、输出；调用处也要注明。
  *
  * 三个窗口：
  *   displayimg          原图+灯条框+装甲板框及可选标注；顶栏 FPS/meanGray；frame/gray 进度条
- *   Frame with Armors   上半原图+框（无数字），下半灰度二值
- *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 倾角 / 数字 / 置信度 / 距离
+ *                       画面按 1920×1080 可用区域缩小（已扣标题栏和 4 条进度条）
+ *   Frame with Armors   上半原图+框（无数字），下半灰度二值；上下拼接后约 2 倍帧高，
+ *                       整体缩到不超过 1920×1080（已扣标题栏/底栏，与 displayimg 同一套上限）
+ *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 板倾角 / 灯条倾角差 / 数字 / 置信度 / 距离
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
  */
@@ -41,8 +43,13 @@ double combined_scale = 1.0;
 
 constexpr int kHudH = 36;
 constexpr int kFontThick = 1;
-constexpr int kMaxWinW = 1920;
-constexpr int kMaxWinH = 1080;
+constexpr int kMaxWinW = 1920;         // 屏幕宽上限；窗口（含边框）不得超过
+constexpr int kMaxWinH = 1080;         // 屏幕高上限；组合大窗约 2 倍帧高，必须按这个缩
+constexpr int kWinChromeW = 40;        // 左右边框，避免贴齐 1920 仍被窗框撑出屏幕
+constexpr int kWinTitleH = 40;         // 标题栏
+constexpr int kTaskbarH = 48;          // 屏幕底栏余量，大窗贴底会被挡住
+constexpr int kTrackbarH = 46;         // GTK 一条进度条大约高度
+constexpr int kDisplayTrackbars = 4;   // displayimg：frame / gray / color / conf
 
 int gray_thres = LightParams::kGrayThresDefault;
 int detect_color = 0;     // 0=红蓝都配，1=只红，2=只蓝；与 ArmorParams::detect_color 同源
@@ -52,7 +59,8 @@ int conf_thres_pct = 80;  // CNN 置信度门槛 ×100（须大于该值）；�
 int overlay_type = 1;   // ArmorBoard::type
 int overlay_lr = 1;     // ArmorBoard::light_ratio，与 isArmor 同一字段
 int overlay_cd = 1;     // ArmorBoard::center_distance
-int overlay_ang = 1;    // ArmorBoard::angle
+int overlay_ang = 1;    // ArmorBoard::angle（两中心连线相对水平）
+int overlay_dAng = 1;   // ArmorBoard::light_angle_diff，与配对同一字段
 int overlay_num = 1;    // number + classification_result
 int overlay_conf = 1;   // ArmorBoard::confidence
 int overlay_dist = 1;   // ArmorBoard::dist_m（PnP）
@@ -101,20 +109,25 @@ bool isRightKey(int key) {
 }
 
 /**
- * 作用：只缩小不放大，保证窗口内容不超过 1920×1080。
- * 输入：img 任意尺寸；scale_out 非空时写出缩放比。
- * 输出：缩小后的图，或原图（已够小）。
+ * 作用：只缩小不放大，让整窗落在 1920×1080 里。
+ * 原理：WINDOW_AUTOSIZE 的窗高 = 图高 + 进度条；组合大窗上下拼接约 2 倍帧高，
+ * 若不扣标题栏/底栏/进度条，图本身缩到 1080 后整窗仍会超出屏幕。
+ * 输入：img 任意尺寸；scale_out 非空时写出缩放比；n_trackbars 为该窗进度条条数
+ * （displayimg 为 4，Frame with Armors 为 0）。
+ * 输出：缩小后的图，或原图（扣完装饰后仍不超过上限）。
  */
-Mat scaleTo1080(const Mat& img, double* scale_out) {
+Mat scaleTo1080(const Mat& img, double* scale_out, int n_trackbars) {
+    const int max_w = std::max(1, kMaxWinW - kWinChromeW);
+    const int max_h = std::max(1, kMaxWinH - kWinTitleH - kTaskbarH - n_trackbars * kTrackbarH);
     const double s = std::min({1.0,
-                               static_cast<double>(kMaxWinW) / std::max(1, img.cols),
-                               static_cast<double>(kMaxWinH) / std::max(1, img.rows)});
+                               static_cast<double>(max_w) / std::max(1, img.cols),
+                               static_cast<double>(max_h) / std::max(1, img.rows)});
     if (scale_out)
         *scale_out = s;
     if (s >= 1.0)
         return img;
     Mat out;
-    resize(img, out, Size(), s, s, INTER_AREA);
+    resize(img, out, Size(), s, s, INTER_AREA);  // 大图 → 1920×1080 可用区域，INTER_AREA 缩小更稳
     return out;
 }
 
@@ -163,15 +176,16 @@ void processArmors(const Mat& raw, LightDetector& light_detector, ArmorDetector&
 }
 
 /**
- * 作用：按 overlay 开关在装甲板旁画 type/lr/cd/ang/num/conf/dist（关一行就上移）。
+ * 作用：按 overlay 开关在装甲板旁画 type/lr/cd/ang/dAng/num/conf/dist（关一行就上移）。
  * 输入：img 为已画框的 BGR；armors 为 get_armors 的结果。
- * 输出：无返回值。数字必须读 ArmorBoard 字段，禁止另算中心距或长度比。
+ * 输出：无返回值。数字必须读 ArmorBoard 字段，禁止另算中心距、长度比或灯条倾角差。
  */
 void drawArmorOverlay(Mat& img, const std::vector<ArmorBoard>& armors) {
     const int line_h = 14;
     for (const auto& armor : armors) {
         const int nlines = (overlay_type ? 1 : 0) + (overlay_lr ? 1 : 0) +
                            (overlay_cd ? 1 : 0) + (overlay_ang ? 1 : 0) +
+                           (overlay_dAng ? 1 : 0) +
                            (overlay_num ? 1 : 0) + (overlay_conf ? 1 : 0) +
                            (overlay_dist ? 1 : 0);
         if (nlines == 0)
@@ -200,6 +214,12 @@ void drawArmorOverlay(Mat& img, const std::vector<ArmorBoard>& armors) {
         }
         if (overlay_ang) {
             putText(img, cv::format("ang:%.1f", armor.angle), Point(org.x, y),
+                    FONT_HERSHEY_PLAIN, 0.95, text, kFontThick, LINE_AA);
+            y += line_h;
+        }
+        if (overlay_dAng) {
+            // light_angle_diff：|Light::angle 左 - Light::angle 右|，与 isArmor 同一字段。
+            putText(img, cv::format("dAng:%.1f", armor.light_angle_diff), Point(org.x, y),
                     FONT_HERSHEY_PLAIN, 0.95, text, kFontThick, LINE_AA);
             y += line_h;
         }
@@ -247,7 +267,7 @@ void drawNumberThumbnails(Mat& img, const std::vector<ArmorBoard>& armors) {
  * 输入：无。输出：BGR 说明图，每帧 imshow，避免空窗被后端丢掉。
  */
 Mat makeOverlayLegend() {
-    Mat panel(160, 520, CV_8UC3, Scalar(28, 28, 28));
+    Mat panel(182, 520, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "0=hide  1=show   (displayimg only)", Point(8, 22),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
     putText(panel, "type=SMALL/LARGE from center_distance", Point(8, 44),
@@ -256,11 +276,13 @@ Mat makeOverlayLegend() {
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "ang=center-line vs horizontal (deg)", Point(8, 88),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "num/conf=CNN 1-8  dist=PnP ||t|| meters", Point(8, 110),
+    putText(panel, "dAng=|L.angle-R.angle|  drop if >6deg", Point(8, 110),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "color 0=both 1=red 2=blue   conf=CNN must >N%", Point(8, 132),
+    putText(panel, "num/conf=CNN 1-8  dist=PnP ||t|| meters", Point(8, 132),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    putText(panel, "color 0=both 1=red 2=blue   conf=CNN must >N%", Point(8, 154),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
-    putText(panel, "H=Light.height  same field as matching", Point(8, 154),
+    putText(panel, "H/angle=Light fields  same as matching", Point(8, 176),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
     return panel;
 }
@@ -372,8 +394,8 @@ int main() {
     const string win_display = "displayimg";
     const string win_combined = "Frame with Armors";
     const string win_overlay = "armor overlay";
-    namedWindow(win_display);
-    namedWindow(win_combined);
+    namedWindow(win_display);  // 带 4 条进度条，保持 AUTOSIZE，尺寸由缩放后的图画布决定
+    namedWindow(win_combined, WINDOW_NORMAL);  // 组合大窗：允许 resizeWindow 钉在 1920×1080 内
     namedWindow(win_overlay);
     createTrackbar("frame", win_display, nullptr, trackbar_max, onFrameTrackbar, &scrubber);
     createTrackbar("gray", win_display, &gray_thres, 255);
@@ -383,6 +405,7 @@ int main() {
     createTrackbar("lr", win_overlay, &overlay_lr, 1);
     createTrackbar("cd", win_overlay, &overlay_cd, 1);
     createTrackbar("ang", win_overlay, &overlay_ang, 1);
+    createTrackbar("dAng", win_overlay, &overlay_dAng, 1);
     createTrackbar("num", win_overlay, &overlay_num, 1);
     createTrackbar("conf", win_overlay, &overlay_conf, 1);
     createTrackbar("dist", win_overlay, &overlay_dist, 1);
@@ -460,7 +483,8 @@ int main() {
 
         const double mean_gray = current_gray.empty() ? 0.0 : mean(current_gray)[0];
         Mat display_canvas = makeDisplayCanvas(vis_info, is_show_fps ? fps : 0.0, mean_gray);
-        Mat shown_display = scaleTo1080(display_canvas, &display_scale);
+        // displayimg 有 4 条进度条，扣掉后再缩到 1920×1080 可用区域
+        Mat shown_display = scaleTo1080(display_canvas, &display_scale, kDisplayTrackbars);
         imshow(win_display, shown_display);
 
         Mat bin_bgr;
@@ -474,8 +498,10 @@ int main() {
         Mat combined;
         vconcat(vis_plain, bin_bgr, combined);
         combined_y_offset = vis_plain.rows;
-        Mat shown_combined = scaleTo1080(combined, &combined_scale);
+        // 上下拼接约 2 倍帧高：无进度条，仍扣标题栏/底栏，缩到不超过 1920×1080
+        Mat shown_combined = scaleTo1080(combined, &combined_scale, 0);
         imshow(win_combined, shown_combined);
+        resizeWindow(win_combined, shown_combined.cols, shown_combined.rows);  // 钉死缩放后尺寸，GTK AUTOSIZE 有时不随图缩小
         imshow(win_overlay, makeOverlayLegend());
 
         const int key = waitKeyEx(15);

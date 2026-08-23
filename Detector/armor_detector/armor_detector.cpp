@@ -10,10 +10,11 @@
  *
  * 原理概要：
  * 同色灯条全组合。先丢掉两灯包围盒里还夹着第三根灯的对（跨过了另一块板）。
- * 再读 ArmorBoard 构造时写入的 light_ratio / center_distance / angle：
+ * 再读 ArmorBoard 构造时写入的 light_ratio / center_distance / angle / light_angle_diff：
  *   长度比 > min_light_ratio；
  *   归一化中心距落入小板或大板区间；
- *   中心连线倾角 < max_angle。
+ *   中心连线倾角 < max_angle；
+ *   |Light::angle 左 - Light::angle 右| 不大于 max_light_angle_diff（默认 6°）。
  * 过关后透视数字、CNN 分类，最后 IPPE PnP。
  */
 #include "armor_detector.h"
@@ -58,7 +59,7 @@ bool ArmorDetector::containLight(const Light& a, const Light& b,
 }
 
 /**
- * 作用：读 ArmorBoard 已写入的三个量判是否像装甲，并写入 type。
+ * 作用：读 ArmorBoard 已写入的四个量判是否像装甲，并写入 type。
  * 输入：构造好的 armor。输出：true 表示通过门槛。
  */
 bool ArmorDetector::isArmor(ArmorBoard& armor) const {
@@ -72,11 +73,13 @@ bool ArmorDetector::isArmor(ArmorBoard& armor) const {
     const bool distance_ok = small_ok || large_ok;
 
     const bool angle_ok = armor.angle < params_.max_angle;
+    // light_angle_diff 已在构造时用 Light::angle 算好；大于 6° 说明两灯条倾角差太大，不像一块板。
+    const bool light_angle_ok = armor.light_angle_diff <= params_.max_light_angle_diff;
 
     // 分界用大板区间下限：比它大的当大板。overlay 的 type 必须读这个字段。
     armor.type = (d > params_.min_large_center_distance) ? ArmorType::LARGE : ArmorType::SMALL;
 
-    return ratio_ok && distance_ok && angle_ok;
+    return ratio_ok && distance_ok && angle_ok && light_angle_ok;
 }
 
 /**
@@ -104,7 +107,7 @@ std::vector<ArmorBoard> ArmorDetector::matchLights(const std::vector<Light>& lig
             if (containLight(a, b, lights))
                 continue;  // 四端点盒里夹了第三根灯 → 跨板错配
 
-            ArmorBoard armor(a, b);  // 两灯 → 左右排序 + 三个几何量
+            ArmorBoard armor(a, b);  // 两灯 → 左右排序 + 四个几何量
             if (isArmor(armor))
                 armors.push_back(std::move(armor));
         }
@@ -118,7 +121,7 @@ std::vector<ArmorBoard> ArmorDetector::matchLights(const std::vector<Light>& lig
  */
 std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& lights,
                                                   const cv::Mat& frame) {
-    // 1) matchLights：同色全组合 → 不夹第三灯 → 长度比/中心距/倾角。
+    // 1) matchLights：同色全组合 → 不夹第三灯 → 长度比/中心距/倾角/灯条倾角差。
     std::vector<ArmorBoard> armors = matchLights(lights);
 
     if (armors.empty())
