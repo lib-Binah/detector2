@@ -3,8 +3,8 @@
  * @brief 灰度阈值灯条检测
  *
  * 注释契约：禁止随意删除本文件注释；改阈值、掩码或筛选条件时必须改注释。
- * 检测用的高/宽/细长比/倾角/面积必须来自 Light 的同一属性或函数，与 overlay 显示
- * 计算方式相同；禁止在此另算 height/width 当细长比。
+ * 检测用的高/宽/细长比/倾角/面积/HSV占比必须来自 Light 的同一属性或函数，与 overlay 显示
+ * 计算方式相同；禁止在此另算 height/width 当细长比，也禁止另算 HSV 占比。
  * 每个函数须写清作用/输入/输出；调用处也要注明调谁、送什么、得到什么。
  * get_lights 每一步必须逐步注释。
  *
@@ -13,8 +13,10 @@
  * 闭运算补小缺口，再找外轮廓。高/宽/细长比/倾角/面积一律用 Light 构造时写入的字段
  * 或由其算出的 area()：筛选和 overlay 同一份数据。
  * 细长比读 Light::ratio（height/width），倾角读 |Light::angle|（度）。
- * 颜色不看 HSV：在旋转矩形内、且落在二值前景上的像素，R>B 计红面积、B>R 计蓝面积，
+ * 颜色先看 RGB：在旋转矩形内、且落在二值前景上的像素，R>B 计红面积、B>R 计蓝面积，
  * 红面积更大判红，蓝面积更大判蓝。
+ * 再按已判颜色做 HSV 二次确认：旋转矩形内 inRange(红=red_params_ / 蓝=blue_params_)
+ * 的像素占矩形栅格面积的比例写入 Light::hsv_ratio，须大于 kHsvRatioMin 才保留。
  */
 #include "light_detector.h"
 
@@ -27,14 +29,31 @@ namespace {
 constexpr int kMinArea = 40;     // 旋转矩形面积下限，滤掉碎点
 constexpr int kMaxArea = 3500;   // 面积上限，滤掉大块误分割
 const double kMaxAbsAngle = 25.0;  // 右上→右下相对竖直的倾角门限（度）
+constexpr double kHsvRatioMin = 0.6;  // 旋转矩形内对应色 HSV 像素占比下限，须大于此值才是灯条
 
 }  // namespace
 
 /**
- * 作用：空检测器，参数用 LightParams 默认值。
+ * 作用：空检测器，灰度用 LightParams 默认值，并写入红/蓝 HSV 默认区间。
  * 输入：无。输出：可直接 get_lights 的实例。
  */
-LightDetector::LightDetector() = default;
+LightDetector::LightDetector() {
+    // OpenCV HSV：H∈[0,180]。红在 0 附近（此处只用低 H 段，未包 170–180 环绕）。
+    red_params_.h_min = 0;
+    red_params_.h_max = 35;
+    red_params_.s_min = 60;
+    red_params_.s_max = 255;
+    red_params_.v_min = 120;
+    red_params_.v_max = 255;
+
+    // 蓝在 H≈80–105（偏青蓝），S 下限较低以兼容过曝发白的蓝灯。
+    blue_params_.h_min = 80;
+    blue_params_.h_max = 105;
+    blue_params_.s_min = 20;
+    blue_params_.s_max = 255;
+    blue_params_.v_min = 150;
+    blue_params_.v_max = 255;
+}
 
 /**
  * 作用：把 gray 进度条的值写进检测器。
@@ -105,7 +124,47 @@ int LightDetector::classifyColorRgb(const cv::Mat& r_gt_b, const cv::Mat& b_gt_r
 }
 
 /**
- * 作用：一帧检出合法灯条：灰度分割 → 几何筛选 → RGB 判色。
+ * 作用：整帧 HSV 按 H/S/V 上下限做 inRange。
+ * 输入：hsv 为 BGR2HSV 图；p 为红或蓝参数。
+ * 输出：落在区间内的像素为 255。
+ */
+cv::Mat LightDetector::hsvMask(const cv::Mat& hsv, const HsvParams& p) const {
+    cv::Mat mask;
+    // inRange：HSV 图 + 上下限 → 该色二值掩码。
+    cv::inRange(hsv,
+                cv::Scalar(p.h_min, p.s_min, p.v_min),
+                cv::Scalar(p.h_max, p.s_max, p.v_max),
+                mask);
+    return mask;
+}
+
+/**
+ * 作用：旋转矩形内符合对应色 HSV 的像素占矩形栅格面积的比例。
+ * 输入：整帧 color_mask、Light 四顶点（左上/右上/左下/右下）。
+ * 输出：[0,1]，供写入 Light::hsv_ratio；框栅格面积为 0 时返回 0。
+ */
+double LightDetector::hsvRatioInRotatedRect(const cv::Mat& color_mask,
+                                            const cv::Point2f pts[4]) const {
+    // pts 不是绕序；fillConvexPoly 必须按凸包绕序，否则对角线交叉。
+    const cv::Point ipts[4] = {pts[0], pts[1], pts[3], pts[2]};  // 左上→右上→右下→左下
+
+    // zeros+fillConvexPoly：四顶点 → 整图大小的旋转矩形栅格掩码（框内 255）。
+    cv::Mat poly = cv::Mat::zeros(color_mask.size(), CV_8UC1);
+    cv::fillConvexPoly(poly, ipts, 4, 255);
+
+    // 分母用栅格像素数，保证占比落在 [0,1]，与 overlay 读的 hsv_ratio 同一套算法。
+    const int poly_area = cv::countNonZero(poly);
+    if (poly_area <= 0)
+        return 0.0;
+
+    // bitwise_and：框 ∩ 该色 HSV → 命中像素。
+    cv::Mat inside;
+    cv::bitwise_and(color_mask, poly, inside);
+    return static_cast<double>(cv::countNonZero(inside)) / static_cast<double>(poly_area);
+}
+
+/**
+ * 作用：一帧检出合法灯条：灰度分割 → 几何筛选 → RGB 判色 → HSV 面积比。
  * 输入：frame 必须 BGR 三通道；bin_out 非空则写入与检测同一张二值图。
  * 输出：通过门限的 Light 列表；空帧或非三通道返回空。
  */
@@ -128,6 +187,12 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
     cv::compare(ch[2], ch[0], r_gt_b, cv::CMP_GT);
     cv::compare(ch[0], ch[2], b_gt_r, cv::CMP_GT);
 
+    // cvtColor+hsvMask：BGR → 整帧红/蓝 HSV 掩码，每个轮廓只做框内占比，避免重复 inRange。
+    cv::Mat hsv;
+    cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);  // BGR 帧 → HSV，H∈[0,180]
+    const cv::Mat red_hsv = hsvMask(hsv, red_params_);    // 红 inRange
+    const cv::Mat blue_hsv = hsvMask(hsv, blue_params_);  // 蓝 inRange
+
     // clone：复制 bin，避免 findContours 改脏调试用的原图。
     // findContours：二值图 → 外轮廓列表（CHAIN_APPROX_SIMPLE 矩形可能只剩 4 点）。
     std::vector<std::vector<cv::Point>> contours;
@@ -148,7 +213,7 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         if (light.height <= 1e-6)
             continue;
 
-        // 同源契约：细长比/面积/倾角只读 Light 字段或 area()，禁止另算 height/width。
+        // 同源契约：细长比/面积/倾角只读 Light 字段或 area()；HSV 占比只读 hsv_ratio。
         if (light.width <= 1e-6)
             continue;
         if (light.ratio < min_ratio || light.ratio > max_ratio)
@@ -166,8 +231,13 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         if (light.color != 1 && light.color != 2)
             continue;
 
+        // hsvRatioInRotatedRect：旋转矩形 ∩ 该色 HSV → 占比，写入 Light::hsv_ratio（overlay 同源）。
+        const cv::Mat& color_hsv = (light.color == 1) ? red_hsv : blue_hsv;
+        light.hsv_ratio = hsvRatioInRotatedRect(color_hsv, light.pts);
+        if (light.hsv_ratio <= kHsvRatioMin)
+            continue;  // HSV 命中面积不够，RGB 投票过了也不当灯条
 
         valid_lights.push_back(light);
     }
-    return valid_lights;  // 通过几何+颜色门限的灯条
+    return valid_lights;  // 通过几何+RGB+HSV 占比门限的灯条
 }

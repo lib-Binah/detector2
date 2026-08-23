@@ -7,7 +7,7 @@
 /**
  * 注释契约（给后续修改者 / 智能体）：
  * 本文件注释说明灯条几何表示的作用与原理。禁止为“精简代码”删除注释；
- * 改字段含义、顶点顺序、高宽公式或 angle 定义时，必须同步改注释。
+ * 改字段含义、顶点顺序、高宽公式、angle 或 hsv_ratio 定义时，必须同步改注释。
  * 检测筛选和 overlay 显示必须读同一个属性或同一个函数（计算方式相同）；
  * 禁止检测用 ratio、显示另算 height/width。改公式只改本类，两边一起变。
  * 每个成员函数须写清作用、输入、输出；调用处也要注明。
@@ -21,6 +21,7 @@
  * 细长比 ratio：构造时写入 height/width，检测筛选和 overlay 都读这个字段。
  * 夹角：右上→右下边相对竖直的角度（度），atan2(Δx, Δy)，竖直时接近 0。
  * 面积：rotatedRect 的 OpenCV 宽×高，筛面积用 area()，不要在检测器里再乘一遍。
+ * hsv_ratio：旋转矩形栅格内符合该色 HSV 的像素占比；筛灯条和 overlay 都读这个字段。
  */
 class Light {
 public:
@@ -31,6 +32,7 @@ public:
     double angle = 0.0;           // 右上→右下相对竖直的夹角（度），近水平时接近 ±90
     double ratio = 0.0;           // height/width，构造时写入；宽过小则为 0
     int color = -1;               // 1=red, 2=blue, 其他=未知（由检测器 RGB 写入）
+    double hsv_ratio = 0.0;       // 框内该色 HSV 像素 / 旋转矩形栅格像素；检测与 overlay 同源
     cv::Point2f pts[4]{};         // [0]左上 [1]右上 [2]左下 [3]右下
 
     /**
@@ -40,9 +42,9 @@ public:
     Light() = default;
 
     /**
-     * 作用：由轮廓算出旋转矩形、四顶点、高/宽/ratio/angle（颜色可稍后写入）。
+     * 作用：由轮廓算出旋转矩形、四顶点、高/宽/ratio/angle（颜色与 hsv_ratio 可稍后写入）。
      * 输入：contour 至少 3 点；color 为 1 红 / 2 蓝，检测阶段常先传 -1。
-     * 输出：写入 rect、rotatedRect、pts、height、width、ratio、angle；不改 color 以外的判色。
+     * 输出：写入 rect、rotatedRect、pts、height、width、ratio、angle；color/hsv_ratio 由检测器后写。
      */
     explicit Light(const std::vector<cv::Point>& contour, int color = -1);
 

@@ -3,15 +3,15 @@
  * @brief 灰度灯条检测的多窗口播放调试
  *
  * 注释契约：禁止随意删除本文件注释；改窗口布局、HUD 内容、进度条或快捷键时必须改注释。
- * overlay 画的 H/W/ratio/ang/color 必须读 Light 的同一属性或函数，与检测筛选
- * 计算方式相同；禁止显示时另写 height/width 或另搞一套细长比。
+ * overlay 画的 H/W/ratio/ang/color/hsv 必须读 Light 的同一属性或函数，与检测筛选
+ * 计算方式相同；禁止显示时另写 height/width 或另搞一套细长比 / HSV 占比。
  * 每个函数须写清作用、输入、输出；调用处也要注明调谁、送什么、得到什么。
  *
  * 三个窗口：
  *   displayimg          原图+旋转矩形及可选标注；画面外顶栏左=FPS/整帧灰度均值（带标签），
  *                       右=鼠标 HSV RGB Gray xy（带类型标签，字粗 1）；frame/gray 进度条
  *   Frame with Lights   上半原图+框（无数字），下半灰度二值；整体缩到不超过 1920x1080
- *   light overlay       0/1 进度条：是否在 displayimg 上画灯条高/宽/细长比/倾角/颜色
+ *   light overlay       0/1 进度条：是否在 displayimg 上画灯条高/宽/细长比/倾角/颜色/HSV占比
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
  */
@@ -58,6 +58,7 @@ int overlay_w = 1;      // 显示 Light::width，与检测同一字段
 int overlay_ratio = 1;  // 显示 Light::ratio，禁止另算 height/width
 int overlay_ang = 1;    // 显示 Light::angle，与检测同一字段
 int overlay_color = 1;  // 显示 Light::color（1 red / 2 blue）
+int overlay_hsv = 1;    // 显示 Light::hsv_ratio，与检测同一字段
 
 /**
  * 作用：只在真正播出新帧时刷新 FPS，暂停时沿用上次，避免 waitKey 把读数打满。
@@ -211,7 +212,7 @@ Mat scaleTo1080(const Mat& img, double* scale_out) {
 /**
  * 作用：对干净原图跑灯条检测，并刷新采样用的 current_frame / current_gray。
  * 输入：raw 为 BGR 帧；detector 会写入 gray_thres；bin/lights 为输出槽。
- * 输出：bin=与检测同一张二值图；lights=通过几何+颜色的灯条。
+ * 输出：bin=与检测同一张二值图；lights=通过几何+RGB+HSV 占比的灯条。
  */
 void processLights(const Mat& raw, LightDetector& detector, Mat& bin,
                    std::vector<Light>& lights) {
@@ -223,16 +224,16 @@ void processLights(const Mat& raw, LightDetector& detector, Mat& bin,
 }
 
 /**
- * 作用：按 overlay 开关在主画面灯条旁画 H/W/ratio/ang/color（关一行就上移，不留空）。
+ * 作用：按 overlay 开关在主画面灯条旁画 H/W/ratio/ang/color/hsv（关一行就上移，不留空）。
  * 输入：img 为已画框的 BGR 图（就地改）；lights 为 get_lights 的结果。
- * 输出：无返回值。数字必须读 Light 字段（height/width/ratio/angle/color），禁止另算。
+ * 输出：无返回值。数字必须读 Light 字段（height/width/ratio/angle/color/hsv_ratio），禁止另算。
  */
 void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
     const int line_h = 12;
     for (const auto& light : lights) {
         const int nlines = (overlay_h ? 1 : 0) + (overlay_w ? 1 : 0) +
                            (overlay_ratio ? 1 : 0) + (overlay_ang ? 1 : 0) +
-                           (overlay_color ? 1 : 0);
+                           (overlay_color ? 1 : 0) + (overlay_hsv ? 1 : 0);
         if (nlines == 0)
             continue;
 
@@ -274,6 +275,11 @@ void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
         if (overlay_color) {
             putText(img, color_text, Point(org.x, y), FONT_HERSHEY_PLAIN, 0.9,
                     color_scalar, kFontThick, LINE_AA);
+            y += line_h;
+        }
+        if (overlay_hsv) {
+            putText(img, cv::format("hsv:%.2f", light.hsv_ratio), Point(org.x, y),
+                    FONT_HERSHEY_PLAIN, 0.9, Scalar(0, 255, 255), kFontThick, LINE_AA);
         }
     }
 }
@@ -283,12 +289,14 @@ void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
  * 输入：无。输出：72×440 的 BGR 图，每帧 imshow，避免空窗被后端丢掉。
  */
 Mat makeOverlayLegend() {
-    Mat panel(72, 440, CV_8UC3, Scalar(28, 28, 28));
+    Mat panel(94, 440, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "0=hide  1=show   (displayimg only)", Point(8, 20),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
     putText(panel, "H=TL-BL  W=TL-TR  ratio=Light.ratio", Point(8, 42),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "ang=tilt deg(TR-BR)  color=red/blue", Point(8, 64),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    putText(panel, "hsv=Light.hsv_ratio (HSV-in-rect / rect)", Point(8, 86),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     return panel;
 }
@@ -425,6 +433,7 @@ int main() {
     createTrackbar("ratio", win_overlay, &overlay_ratio, 1);
     createTrackbar("ang", win_overlay, &overlay_ang, 1);
     createTrackbar("color", win_overlay, &overlay_color, 1);
+    createTrackbar("hsv", win_overlay, &overlay_hsv, 1);
 
     auto syncTrackbar = [&]() {
         scrubber.syncing = true;
@@ -484,7 +493,7 @@ int main() {
             light.draw_light(vis_info);   // Light 四顶点 → 画面上的黄/橙框
             light.draw_light(vis_plain);
         }
-        drawLightRotatedInfo(vis_info, lights);  // 读 Light 字段画 H/W/ratio/ang/color
+        drawLightRotatedInfo(vis_info, lights);  // 读 Light 字段画 H/W/ratio/ang/color/hsv
 
         const double mean_gray = current_gray.empty() ? 0.0 : mean(current_gray)[0];
         Mat display_canvas = makeDisplayCanvas(vis_info, is_show_fps ? fps : 0.0, mean_gray);  // 画面+顶栏

@@ -12,9 +12,9 @@
 #include <cmath>
 
 /**
- * 作用：由轮廓填充灯条几何（颜色可稍后写）。
+ * 作用：由轮廓填充灯条几何（颜色与 hsv_ratio 可稍后写）。
  * 输入：contour 至少 3 点；color 1 红 / 2 蓝，检测时常传 -1。
- * 输出：写入 rect、rotatedRect、pts、height、width、ratio、angle。
+ * 输出：写入 rect、rotatedRect、pts、height、width、ratio、angle；hsv_ratio 保持 0。
  */
 Light::Light(const std::vector<cv::Point>& contour, int color)
     : color(color) {
