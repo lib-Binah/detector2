@@ -5,6 +5,7 @@
  * 注释契约：禁止随意删除本文件注释；改窗口布局、HUD 内容、进度条或快捷键时必须改注释。
  * overlay 画的 H/W/ratio/ang/color 必须读 Light 的同一属性或函数，与检测筛选
  * 计算方式相同；禁止显示时另写 height/width 或另搞一套细长比。
+ * 每个函数须写清作用、输入、输出；调用处也要注明调谁、送什么、得到什么。
  *
  * 三个窗口：
  *   displayimg          原图+旋转矩形及可选标注；画面外顶栏左=FPS/整帧灰度均值（带标签），
@@ -58,7 +59,11 @@ int overlay_ratio = 1;  // 显示 Light::ratio，禁止另算 height/width
 int overlay_ang = 1;    // 显示 Light::angle，与检测同一字段
 int overlay_color = 1;  // 显示 Light::color（1 red / 2 blue）
 
-/** 只在真正播到新帧时更新，暂停时沿用上次，避免 waitKey 循环把 FPS 打满。 */
+/**
+ * 作用：只在真正播出新帧时刷新 FPS，暂停时沿用上次，避免 waitKey 把读数打满。
+ * 输入：fps 为要写入的变量；enabled 为 false 则不改 fps。
+ * 输出：通过 fps 写回 1/Δt（秒⁻¹）。
+ */
 void updateFps(double& fps, bool enabled) {
     if (!enabled)
         return;
@@ -68,7 +73,10 @@ void updateFps(double& fps, bool enabled) {
     last = now;
 }
 
-/** 主窗口鼠标：先除 view 缩放，再减去顶栏，得到原图像素坐标。 */
+/**
+ * 作用：把 displayimg 窗口鼠标坐标映回原图像素。
+ * 输入：x/y 为窗口像素（含顶栏）。输出：相对未缩放原图的点（已减顶栏）。
+ */
 Point toDisplayCoord(int x, int y) {
     if (display_scale > 0.0) {
         x = static_cast<int>(x / display_scale + 0.5);
@@ -78,7 +86,10 @@ Point toDisplayCoord(int x, int y) {
     return Point(x, y);
 }
 
-/** 组合窗鼠标：下半二值与上半原图同一套 xy，落在下半时减掉上半高度。 */
+/**
+ * 作用：把组合窗鼠标坐标映回原图像素（上下两半共用一套 xy）。
+ * 输入：x/y 为组合窗像素。输出：相对原图的点；落在下半时已减上半高度。
+ */
 Point toCombinedCoord(int x, int y) {
     if (combined_scale > 0.0) {
         x = static_cast<int>(x / combined_scale + 0.5);
@@ -89,7 +100,10 @@ Point toCombinedCoord(int x, int y) {
     return Point(x, y);
 }
 
-/** 在未画框的 current_frame 上取 HSV / RGB / 灰度；越界则 show_pixel=false。 */
+/**
+ * 作用：在未画框的 current_frame 上采样鼠标处 HSV/RGB/灰度，供顶栏显示。
+ * 输入：x/y 为原图像素。输出：写入 mouse_* / hsv_value；越界则 show_pixel=false。
+ */
 void samplePixel(int x, int y) {
     mouse_pos = Point(x, y);
     show_pixel = false;
@@ -101,7 +115,7 @@ void samplePixel(int x, int y) {
     mouse_bgr = current_frame.at<Vec3b>(y, x);
     Mat bgr_mat(1, 1, CV_8UC3, Scalar(mouse_bgr[0], mouse_bgr[1], mouse_bgr[2]));
     Mat hsv_mat;
-    cvtColor(bgr_mat, hsv_mat, COLOR_BGR2HSV);
+    cvtColor(bgr_mat, hsv_mat, COLOR_BGR2HSV);  // 1x1 BGR → HSV，H∈[0,180]
     const Vec3b hsv = hsv_mat.at<Vec3b>(0, 0);
     hsv_value = Scalar(hsv[0], hsv[1], hsv[2]);
 
@@ -114,16 +128,26 @@ void samplePixel(int x, int y) {
     show_pixel = true;
 }
 
+/**
+ * 作用：displayimg 鼠标移动回调，把窗口坐标换成原图像素再采样。
+ * 输入：OpenCV 鼠标事件；只用 EVENT_MOUSEMOVE。输出：更新顶栏像素信息。
+ */
 void onMouseDisplay(int event, int x, int y, int, void*) {
     if (event != EVENT_MOUSEMOVE)
         return;
+    // toDisplayCoord：窗口 xy → 原图像素；samplePixel：该像素 → HSV/RGB/Gray。
     const Point p = toDisplayCoord(x, y);
     samplePixel(p.x, p.y);
 }
 
+/**
+ * 作用：组合窗鼠标移动回调，上下半用同一套原图 xy 采样。
+ * 输入：OpenCV 鼠标事件。输出：更新顶栏像素信息。
+ */
 void onMouseCombined(int event, int x, int y, int, void*) {
     if (event != EVENT_MOUSEMOVE)
         return;
+    // toCombinedCoord：组合窗 xy → 原图像素（下半减上半高）。
     const Point p = toCombinedCoord(x, y);
     samplePixel(p.x, p.y);
 }
@@ -135,6 +159,10 @@ struct FrameScrubber {
     bool syncing = false;  // 程序自己同步滑条时禁止再触发 seek，否则死循环
 };
 
+/**
+ * 作用：frame 进度条回调。GTK 禁止在回调里 setTrackbarPos，只置 seek，主循环再跳帧。
+ * 输入：pos 为目标帧号；userdata 为 FrameScrubber*。输出：写入 want/seek。
+ */
 void onFrameTrackbar(int pos, void* userdata) {
     auto* s = static_cast<FrameScrubber*>(userdata);
     if (s->syncing)
@@ -144,17 +172,29 @@ void onFrameTrackbar(int pos, void* userdata) {
 }
 
 // 左/右方向键在 GTK、Qt、Windows 下 key 码不同，再加 a/d。
+/**
+ * 作用：判断是否为「上一帧」键。
+ * 输入：waitKeyEx 原始键码。输出：true 表示左方向键或 a。
+ */
 bool isLeftKey(int key) {
     const int k = key & 0xFF;
     return key == 81 || key == 2 || key == 2424832 || key == 65361 || k == 'a';
 }
 
+/**
+ * 作用：判断是否为「下一帧」键。
+ * 输入：waitKeyEx 原始键码。输出：true 表示右方向键或 d。
+ */
 bool isRightKey(int key) {
     const int k = key & 0xFF;
     return key == 83 || key == 3 || key == 2555904 || key == 65363 || k == 'd';
 }
 
-/** 只缩小不放大，保证内容不超过 1920x1080；scale_out 给鼠标坐标反变换用。 */
+/**
+ * 作用：只缩小不放大，保证窗口内容不超过 1920×1080。
+ * 输入：img 任意尺寸；scale_out 非空时写出缩放比（给鼠标反变换）。
+ * 输出：缩小后的图，或原图（已够小）。
+ */
 Mat scaleTo1080(const Mat& img, double* scale_out) {
     const double s = std::min({1.0,
                                static_cast<double>(kMaxWinW) / std::max(1, img.cols),
@@ -164,27 +204,28 @@ Mat scaleTo1080(const Mat& img, double* scale_out) {
     if (s >= 1.0)
         return img;
     Mat out;
-    resize(img, out, Size(), s, s, INTER_AREA);
+    resize(img, out, Size(), s, s, INTER_AREA);  // 大图 → ≤1080p，INTER_AREA 缩小更稳
     return out;
 }
 
-/** 用干净 raw 做检测；gray_thres 来自进度条。 */
+/**
+ * 作用：对干净原图跑灯条检测，并刷新采样用的 current_frame / current_gray。
+ * 输入：raw 为 BGR 帧；detector 会写入 gray_thres；bin/lights 为输出槽。
+ * 输出：bin=与检测同一张二值图；lights=通过几何+颜色的灯条。
+ */
 void processLights(const Mat& raw, LightDetector& detector, Mat& bin,
                    std::vector<Light>& lights) {
     current_frame = raw.clone();
-    cvtColor(current_frame, current_gray, COLOR_BGR2GRAY);
-    detector.setGrayThres(gray_thres);
+    cvtColor(current_frame, current_gray, COLOR_BGR2GRAY);  // BGR → 灰度，供顶栏 Gray/meanGray
+    detector.setGrayThres(gray_thres);  // 进度条 int → 检测器 [0,255] 阈值
+    // get_lights：BGR 帧 → lights；&bin 写出 get_bin 的二值图（阈值+闭运算）。
     lights = detector.get_lights(current_frame, &bin);
 }
 
 /**
- * 主窗口画面内按 overlay_* 开关逐行画（字粗 1，带标签；关掉某一行就上移，不留空行）。
- * 同源契约：下面每一项都读 Light 已有字段，与 light_detector 筛选同一来源、同一公式：
- *   H     = Light::height（左上→左下）
- *   W     = Light::width（左上→右上）
- *   ratio = Light::ratio（构造时 height/width，禁止再写 height/width）
- *   ang   = Light::angle（右上→右下相对竖直，度）
- *   color = Light::color（1 red / 2 blue / 其他 ?）
+ * 作用：按 overlay 开关在主画面灯条旁画 H/W/ratio/ang/color（关一行就上移，不留空）。
+ * 输入：img 为已画框的 BGR 图（就地改）；lights 为 get_lights 的结果。
+ * 输出：无返回值。数字必须读 Light 字段（height/width/ratio/angle/color），禁止另算。
  */
 void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
     const int line_h = 12;
@@ -205,7 +246,7 @@ void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
             color_scalar = Scalar(255, 0, 0);
         }
 
-        Point org(cvRound(light.center().x + 6), cvRound(light.center().y));
+        Point org(cvRound(light.center().x + 6), cvRound(light.center().y));  // center()：旋转矩形中心
         org.x = std::clamp(org.x, 2, std::max(2, img.cols - 110));
         org.y = std::clamp(org.y, 12, std::max(12, img.rows - line_h * nlines - 4));
 
@@ -238,8 +279,8 @@ void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
 }
 
 /**
- * overlay 窗的说明图：进度条名字太短，用画面写清 0/1 含义和几何定义。
- * Hershey 无中文。每帧 imshow 一次，避免空窗被部分后端丢掉。
+ * 作用：给 overlay 窗生成说明图（进度条名字太短，用画面写 0/1 和几何定义）。
+ * 输入：无。输出：72×440 的 BGR 图，每帧 imshow，避免空窗被后端丢掉。
  */
 Mat makeOverlayLegend() {
     Mat panel(72, 440, CV_8UC3, Scalar(28, 28, 28));
@@ -253,10 +294,9 @@ Mat makeOverlayLegend() {
 }
 
 /**
- * 顶栏画在画面外（带类型标签，Hershey 无中文所以用英文）：
- *   左 = FPS（帧率）+ meanGray（整帧灰度均值）
- *   右 = HSV(H∈[0,180]) RGB Gray xy（鼠标处像素，相对原图）
- * 十字丝画在画面内鼠标处，数字不叠在图上。
+ * 作用：把检测画面接到带标签的顶栏下面（FPS/meanGray、鼠标 HSV RGB Gray xy）。
+ * 输入：vis 为已画灯条的画面；fps、mean_gray 为顶栏左侧数字。
+ * 输出：高 = vis.rows+kHudH 的画布；十字丝在画面内，数字在顶栏。
  */
 Mat makeDisplayCanvas(const Mat& vis, double fps, double mean_gray) {
     Mat canvas(vis.rows + kHudH, vis.cols, CV_8UC3, Scalar(28, 28, 28));
@@ -290,6 +330,10 @@ Mat makeDisplayCanvas(const Mat& vis, double fps, double mean_gray) {
     return canvas;
 }
 
+/**
+ * 作用：打开视频，循环检测并显示 displayimg / 组合窗 / overlay。
+ * 输入：从 stdin 读 0–4 选视频。输出：进程退出码 0 成功，非 0 打不开视频。
+ */
 int main() {
     // 相对 cmake-build-debug 时 ../../Video 指向 TDT/Video；多前缀兼容其它工作目录。
     const string names[] = {
@@ -371,10 +415,10 @@ int main() {
     namedWindow(win_display);
     namedWindow(win_combined);
     namedWindow(win_overlay);
-    setMouseCallback(win_display, onMouseDisplay, nullptr);
-    setMouseCallback(win_combined, onMouseCombined, nullptr);
-    createTrackbar("frame", win_display, nullptr, trackbar_max, onFrameTrackbar, &scrubber);
-    createTrackbar("gray", win_display, &gray_thres, 255);
+    setMouseCallback(win_display, onMouseDisplay, nullptr);  // 窗口 xy → toDisplayCoord → samplePixel
+    setMouseCallback(win_combined, onMouseCombined, nullptr);  // 组合窗 xy → toCombinedCoord → samplePixel
+    createTrackbar("frame", win_display, nullptr, trackbar_max, onFrameTrackbar, &scrubber);  // 拖动 → seek 标志
+    createTrackbar("gray", win_display, &gray_thres, 255);  // 直接改 gray_thres，无回调；主循环比对 last_gray
     // overlay 全是 0/1：只控制 displayimg 文字，不触发重检。max 必须 >=1（GTK）。
     createTrackbar("H", win_overlay, &overlay_h, 1);
     createTrackbar("W", win_overlay, &overlay_w, 1);
@@ -395,7 +439,7 @@ int main() {
         if (raw.empty())
             return false;
         shown_index = idx;
-        processLights(raw, detector, bin, lights);
+        processLights(raw, detector, bin, lights);  // raw(BGR) → lights + bin（get_bin 同源）
         last_gray = gray_thres;
         syncTrackbar();
         return true;
@@ -407,7 +451,7 @@ int main() {
             return false;
         const int pos = static_cast<int>(cap.get(CAP_PROP_POS_FRAMES));
         shown_index = std::clamp(pos - 1, 0, last_index);
-        processLights(raw, detector, bin, lights);
+        processLights(raw, detector, bin, lights);  // 下一帧 BGR → lights + bin
         last_gray = gray_thres;
         syncTrackbar();
         return true;
@@ -422,12 +466,12 @@ int main() {
             if (!grabNext())
                 paused = true;  // 播到结尾当暂停，不退出
             else
-                updateFps(fps, is_show_fps);
+                updateFps(fps, is_show_fps);  // 新帧 Δt → fps；暂停不走这里
         }
 
         // 暂停时改 gray 也立刻重检，否则二值窗看起来像没跟上。
         if (!raw.empty() && gray_thres != last_gray) {
-            processLights(raw, detector, bin, lights);
+            processLights(raw, detector, bin, lights);  // 同一帧、新 gray_thres → 重算 lights/bin
             last_gray = gray_thres;
         }
 
@@ -437,14 +481,14 @@ int main() {
         Mat vis_info = current_frame.clone();
         Mat vis_plain = current_frame.clone();
         for (auto& light : lights) {
-            light.draw_light(vis_info);
+            light.draw_light(vis_info);   // Light 四顶点 → 画面上的黄/橙框
             light.draw_light(vis_plain);
         }
-        drawLightRotatedInfo(vis_info, lights);
+        drawLightRotatedInfo(vis_info, lights);  // 读 Light 字段画 H/W/ratio/ang/color
 
         const double mean_gray = current_gray.empty() ? 0.0 : mean(current_gray)[0];
-        Mat display_canvas = makeDisplayCanvas(vis_info, is_show_fps ? fps : 0.0, mean_gray);
-        Mat shown_display = scaleTo1080(display_canvas, &display_scale);
+        Mat display_canvas = makeDisplayCanvas(vis_info, is_show_fps ? fps : 0.0, mean_gray);  // 画面+顶栏
+        Mat shown_display = scaleTo1080(display_canvas, &display_scale);  // 画布 → ≤1080p
         imshow(win_display, shown_display);
 
         Mat bin_bgr;
@@ -458,9 +502,9 @@ int main() {
         Mat combined;
         vconcat(vis_plain, bin_bgr, combined);
         combined_y_offset = vis_plain.rows;
-        Mat shown_combined = scaleTo1080(combined, &combined_scale);
+        Mat shown_combined = scaleTo1080(combined, &combined_scale);  // 上下拼接图 → ≤1080p
         imshow(win_combined, shown_combined);
-        imshow(win_overlay, makeOverlayLegend());
+        imshow(win_overlay, makeOverlayLegend());  // 无输入 → 0/1 说明图
 
         const int key = waitKeyEx(15);
         if (key < 0)

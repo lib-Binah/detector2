@@ -10,6 +10,7 @@
  * 改字段含义、顶点顺序、高宽公式或 angle 定义时，必须同步改注释。
  * 检测筛选和 overlay 显示必须读同一个属性或同一个函数（计算方式相同）；
  * 禁止检测用 ratio、显示另算 height/width。改公式只改本类，两边一起变。
+ * 每个成员函数须写清作用、输入、输出；调用处也要注明。
  *
  * 单根装甲板侧边灯条的几何结果。
  * 原理：轮廓 → 轴对齐外接框 + 最小外接旋转矩形 →
@@ -32,24 +33,37 @@ public:
     int color = -1;               // 1=red, 2=blue, 其他=未知（由检测器 RGB 写入）
     cv::Point2f pts[4]{};         // [0]左上 [1]右上 [2]左下 [3]右下
 
+    /**
+     * 作用：空灯条，字段保持默认 0 / -1。
+     * 输入：无。输出：未填充的 Light，检测路径不会用这个。
+     */
     Light() = default;
 
     /**
-     * 由轮廓构造几何（颜色可稍后写入）。
-     * @param contour 输入轮廓，至少 3 点
-     * @param color   颜色 ID（1 红 / 2 蓝），检测阶段常先传 -1
+     * 作用：由轮廓算出旋转矩形、四顶点、高/宽/ratio/angle（颜色可稍后写入）。
+     * 输入：contour 至少 3 点；color 为 1 红 / 2 蓝，检测阶段常先传 -1。
+     * 输出：写入 rect、rotatedRect、pts、height、width、ratio、angle；不改 color 以外的判色。
      */
     explicit Light(const std::vector<cv::Point>& contour, int color = -1);
 
-    /** 旋转矩形中心，画标注时当锚点 */
+    /**
+     * 作用：给 overlay 标注当锚点。
+     * 输入：无（读 rotatedRect）。输出：旋转矩形中心。
+     */
     cv::Point2f center() const { return rotatedRect.center; }
 
-    /** minAreaRect 宽×高。筛面积、调试都走这里，与 rotatedRect 同一份数据 */
+    /**
+     * 作用：筛面积、调试用的灯条面积。必须走这里，禁止在检测器里再乘宽高。
+     * 输入：无（读 rotatedRect.size）。输出：minAreaRect 的宽×高（像素²）。
+     */
     double area() const {
         return static_cast<double>(rotatedRect.size.width) * rotatedRect.size.height;
     }
 
-    /** 按绕序画闭合四边形；红→亮黄，蓝→亮橙，避免和灯体抢色 */
+    /**
+     * 作用：按绕序把灯条框画到图上；红→亮黄，蓝→亮橙，避免和灯体抢色。
+     * 输入：img 为要画的 BGR 图（就地修改）。输出：无返回值，四条边画在 img 上。
+     */
     void draw_light(cv::Mat& img) const;
 };
 

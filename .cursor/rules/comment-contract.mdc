@@ -1,5 +1,5 @@
 ---
-description: 禁止删注释；改代码必须同步改注释，防止 agent 精简时丢掉说明
+description: 禁止删注释；改代码必须同步改注释；函数必须写清作用/输入/输出，调用处也要注明
 globs: Detector/light_detector_gray/**/*.{h,hpp,cpp},CMakeLists.txt
 alwaysApply: true
 ---
@@ -13,6 +13,13 @@ alwaysApply: true
 3. **新增逻辑要写注释**。新阈值、新几何量、新窗口/进度条，用一两句话写清作用与原理。
 4. **注释与代码不一致时，以代码为准并立刻改注释**，不要删注释来“消歧”。
 5. **检测和显示必须同源**。筛灯条用的量（高、宽、细长比、倾角、面积、颜色等）和 overlay / HUD 画出来的量，必须读 `Light` 的**同一个属性或同一个函数**，计算方式相同。禁止检测走 `ratio`、显示另写 `height/width` 或另搞一个 `hw_ratio()`。改公式只改 Light 一处，检测器和播放器一起跟着变。
+6. **每个函数必须写清作用、输入、输出**。声明处（头文件或定义处）用注释写：
+   - **作用**：这个函数干什么、为什么需要；
+   - **输入**：参数含义、约定（通道数、点数下限、空指针是否允许）；
+   - **输出**：返回值/写出参数含义，失败时返回什么。
+   改函数签名或语义时必须同步改这三项。
+7. **调用处也要注释**。调用本仓库函数或关键 OpenCV 函数时，在调用点用一行注明：调的是谁、送来什么、得到什么。禁止只写函数名不写意图。例如：`get_bin(frame)` 旁写「BGR/灰度帧 → 二值前景（阈值+闭运算）」。
+8. **get_lights 流水线必须逐步注释**。每一步写清作用与原理：`get_bin`、整帧 R>B/B>R、`clone`+`findContours`、读 `Light` 几何筛选、`classifyColorRgb`。改任一步必须改对应注释。
 
 ## 反例 / 正例
 
@@ -25,10 +32,17 @@ height = cv::norm(pts[0] - pts[2]);
 height = cv::norm(pts[0] - pts[2]);
 
 // ❌ BAD：检测和显示各算一遍，数值会对不上
-if (light.ratio < min_ratio) continue;           // 检测读字段
-putText(..., light.height / light.width, ...);   // 显示另算
+if (light.ratio < min_ratio) continue;
+putText(..., light.height / light.width, ...);
 
 // ✅ GOOD：两边都读 Light::ratio（构造时写入 height/width）
 if (light.ratio < min_ratio) continue;
 putText(..., light.ratio, ...);
+
+// ❌ BAD：函数无输入输出说明；调用处也不写
+const cv::Mat bin = get_bin(frame);
+
+// ✅ GOOD：声明写清 I/O；调用处再点明意图
+// 作用：灰度阈值+闭运算得到灯条前景。输入：BGR 或灰度帧。输出：CV_8UC1 二值图。
+const cv::Mat bin = get_bin(frame);  // frame(BGR) → bin(亮区=255)，与调试窗同一张图
 ```

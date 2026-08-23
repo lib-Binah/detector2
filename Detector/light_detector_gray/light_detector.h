@@ -11,6 +11,8 @@
  * 改灰度阈值、形态学、几何门限或 RGB 判色时，必须同步修改对应注释。
  * 几何筛选必须读 Light 的属性或函数（ratio、angle、area() 等），与 overlay
  * 显示同源、计算方式相同；禁止在本文件里另写一套高宽比。
+ * 每个函数须写清作用、输入、输出；调用处也要注明调谁、送什么、得到什么。
+ * get_lights 每一步必须逐步注释（get_bin / R>B / findContours / 几何 / 判色）。
  *
  * 装甲板灯条检测：BGR→灰度阈值分割 + 轮廓几何筛选 + 旋转矩形内 RGB 判色。
  * 不用 HSV 取色。过曝灯芯在灰度上仍是高亮，单阈值即可接住。
@@ -26,26 +28,50 @@ struct LightParams {
 
 class LightDetector {
 public:
+    /**
+     * 作用：空检测器，参数用 LightParams 默认值（含 kGrayThresDefault）。
+     * 输入：无。输出：可直接 get_lights 的实例。
+     */
     LightDetector();
 
-    /** 夹紧到 [0,255] 后写入；播放窗口 gray 进度条走这里 */
+    /**
+     * 作用：把播放窗口 gray 进度条的值写进检测器。
+     * 输入：thres 任意 int，内部夹到 [0,255]。输出：无；之后 get_bin 用新阈值。
+     */
     void setGrayThres(int thres);
+
+    /**
+     * 作用：读出当前灰度阈值。
+     * 输入：无。输出：[0,255]，与进度条/get_bin 用的是同一份 params_.gray_thres。
+     */
     int grayThres() const { return params_.gray_thres; }
+
+    /**
+     * 作用：只读查看全部检测参数。
+     * 输入：无。输出：LightParams 常引用，不要改它来调阈值（走 setGrayThres）。
+     */
     const LightParams& params() const { return params_; }
 
     /**
-     * 灰度阈值 → 闭运算 → 外轮廓 → 几何筛选 → RGB 判红/蓝。
-     * @param bin_out 非空时写出与检测一致的二值图（已闭运算），给调试窗用
+     * 作用：一帧里检出合法灯条（灰度分割 → 几何筛选 → RGB 判红/蓝）。
+     * 输入：frame 必须是 BGR 三通道；bin_out 非空时写入与检测同一张已闭运算二值图。
+     * 输出：通过几何+颜色门限的 Light 列表；空帧或非三通道返回空。
      */
     std::vector<Light> get_lights(const cv::Mat& frame, cv::Mat* bin_out = nullptr);
 
-    /** 调试用二值：灰度阈值 + 3x3 椭圆闭运算，与 get_lights 同一套掩码 */
+    /**
+     * 作用：得到灯条高亮前景，给找轮廓和调试窗用（必须同一张图）。
+     * 输入：frame 为 BGR 三通道或单通道灰度。
+     * 输出：CV_8UC1，灰度 > gray_thres 为 255，再 3x3 椭圆闭运算补灯芯黑洞。
+     */
     cv::Mat get_bin(const cv::Mat& frame) const;
 
 private:
     /**
-     * 旋转矩形 ∩ 二值前景内，比较 R>B 与 B>R 的像素面积。
-     * @return 1 红 / 2 蓝 / -1 相等或没有前景
+     * 作用：在灯条框 ∩ 灰度前景上，用 R>B / B>R 像素数投票判红蓝（不用 HSV）。
+     * 输入：r_gt_b、b_gt_r 为整帧比较掩码；bin 为 get_bin 结果；pts 为 Light 四顶点
+     *      （左上/右上/左下/右下，函数内会改成绕序再填凸包）。
+     * 输出：1 红 / 2 蓝 / -1 票数相等或框内无前景（调用处丢掉）。
      */
     int classifyColorRgb(const cv::Mat& r_gt_b, const cv::Mat& b_gt_r,
                          const cv::Mat& bin, const cv::Point2f pts[4]) const;
