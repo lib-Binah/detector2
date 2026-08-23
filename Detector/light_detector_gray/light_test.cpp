@@ -8,7 +8,7 @@
  *   displayimg          原图+旋转矩形及可选标注；画面外顶栏左=FPS/整帧灰度均值（带标签），
  *                       右=鼠标 HSV RGB Gray xy（带类型标签，字粗 1）；frame/gray 进度条
  *   Frame with Lights   上半原图+框（无数字），下半灰度二值；整体缩到不超过 1920x1080
- *   light overlay       0/1 进度条：是否在 displayimg 上画灯条高/宽/细长比/tan_xy/颜色
+ *   light overlay       0/1 进度条：是否在 displayimg 上画灯条高/宽/细长比/倾角/颜色
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
  */
@@ -54,7 +54,7 @@ int gray_thres = kGrayThresDefault;
 int overlay_h = 1;      // 高：左上→左下（Light::height）
 int overlay_w = 1;      // 宽：左上→右上（Light::width）
 int overlay_ratio = 1;  // 细长比 height/width
-int overlay_ang = 1;    // tan_xy（右上→右下 Δx/Δy）
+int overlay_ang = 1;    // 右上→右下相对竖直夹角（度）
 int overlay_color = 1;  // red / blue / ?
 
 /** 只在真正播到新帧时更新，暂停时沿用上次，避免 waitKey 循环把 FPS 打满。 */
@@ -181,7 +181,7 @@ void processLights(const Mat& raw, LightDetector& detector, Mat& bin,
  *   H     = Light::height（左上→左下）
  *   W     = Light::width（左上→右上）
  *   ratio = height / width
- *   tan   = Light::tan_xy（右上→右下 Δx/Δy）
+ *   ang   = Light::angle（右上→右下相对竖直，度）
  *   color = red / blue / ?
  */
 void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
@@ -224,7 +224,7 @@ void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
             y += line_h;
         }
         if (overlay_ang) {
-            putText(img, cv::format("tan:%.2f", light.tan_xy), Point(org.x, y),
+            putText(img, cv::format("ang:%.1f", light.angle), Point(org.x, y),
                     FONT_HERSHEY_PLAIN, 0.9, Scalar(0, 255, 255), kFontThick, LINE_AA);
             y += line_h;
         }
@@ -245,7 +245,7 @@ Mat makeOverlayLegend() {
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
     putText(panel, "H=TL-BL  W=TL-TR  ratio=H/W", Point(8, 42),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "tan=dx/dy(TR-BR)  color=red/blue", Point(8, 64),
+    putText(panel, "ang=tilt deg(TR-BR)  color=red/blue", Point(8, 64),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     return panel;
 }
@@ -377,7 +377,7 @@ int main() {
     createTrackbar("H", win_overlay, &overlay_h, 1);
     createTrackbar("W", win_overlay, &overlay_w, 1);
     createTrackbar("ratio", win_overlay, &overlay_ratio, 1);
-    createTrackbar("tan", win_overlay, &overlay_ang, 1);
+    createTrackbar("ang", win_overlay, &overlay_ang, 1);
     createTrackbar("color", win_overlay, &overlay_color, 1);
 
     auto syncTrackbar = [&]() {

@@ -7,7 +7,7 @@
  * 原理概要：
  * 灯条是高亮、近竖直的细长色块。先把 BGR 转灰度，大于 gray_thres 的像素为前景，
  * 闭运算补小缺口，再找外轮廓。用旋转矩形四顶点计算高（左上→左下）、
- * 宽（左上→右上）。细长比用 height/width。倾角用 |tan_xy|（右上→右下的 Δx/Δy）。
+ * 宽（左上→右上）。细长比用 height/width。倾角用 |angle|（右上→右下相对竖直，度）。
  * 颜色不看 HSV：在旋转矩形内、且落在二值前景上的像素，R>B 计红面积、B>R 计蓝面积，
  * 红面积更大判红，蓝面积更大判蓝。
  */
@@ -21,8 +21,7 @@ namespace {
 
 constexpr int kMinArea = 40;     // 旋转矩形面积下限，滤掉碎点
 constexpr int kMaxArea = 3500;   // 面积上限，滤掉大块误分割
-// |tan_xy| 上限 ≈ tan(25°)。近水平时 dy 很小、|tan_xy| 会被放大，正好丢掉。
-const float kMaxAbsTanXy = std::tan(25.0 * CV_PI / 180.0);
+const double kMaxAbsAngle = 25.0;  // 右上→右下相对竖直的倾角门限（度）
 
 }  // namespace
 
@@ -112,7 +111,7 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         // 细长比 = 高 / 宽。宽已是短边（左上→右上）。
         if (light.width <= 1e-6)
             continue;
-        const double ratio = light.height / light.width;
+        const double ratio = light.ratio;
         if (ratio < min_ratio || ratio > max_ratio)
             continue;
 
@@ -120,7 +119,7 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         if (area < kMinArea || area > kMaxArea)
             continue;
 
-        if (std::fabs(light.tan_xy) > kMaxAbsTanXy)
+        if (std::fabs(light.angle) > kMaxAbsAngle)
             continue;
 
         light.color = classifyColorRgb(r_gt_b, b_gt_r, bin, light.pts);

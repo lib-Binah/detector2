@@ -1,7 +1,7 @@
 /**
  * 注释契约：禁止随意删除本文件注释；改顶点排序、高宽公式、夹角或绘制颜色时必须改注释。
  *
- * 灯条几何构造与可视化：minAreaRect → 顶点重排 → 高/宽/tan_xy → 画框。
+ * 灯条几何构造与可视化：minAreaRect → 顶点重排 → 高/宽/倾角 → 画框。
  */
 #include "Light.h"
 
@@ -28,14 +28,11 @@ Light::Light(const std::vector<cv::Point>& contour, int color)
     height = cv::norm(pts[0] - pts[2]);
     width = cv::norm(pts[0] - pts[1]);
 
-    // 用右上→右下边的 Δx/Δy 近似灯条倾斜。竖直灯条 dy 大、tan≈0；
-    // dy 过小（近水平）时除法会放大，后续用 |tan_xy| 门限丢掉。
+    // 右上→右下边相对竖直的夹角。竖直时 dy 大、angle≈0；
+    // atan2(dx, dy) 在 dy≈0（近水平）时得到 ±90°，检测器用 |angle| 门限丢掉。
     const float dx = pts[1].x - pts[3].x;
     const float dy = pts[3].y - pts[1].y;
-    if (std::fabs(dy) < 1e-6f)
-        tan_xy = (dx >= 0.0f ? 1e6f : -1e6f);
-    else
-        tan_xy = dx / dy;
+    angle = std::atan2(dx, dy) * 180.0 / CV_PI;
 }
 
 void Light::draw_light(cv::Mat& img) const {

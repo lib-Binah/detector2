@@ -14,8 +14,8 @@
  * 不用 HSV 取色。过曝灯芯在灰度上仍是高亮，单阈值即可接住。
  */
 struct LightParams {
-    int gray_thres = 180;           // 灰度下限，像素 > 该值视为前景；播放时可调
-    int min_height_width = 3;       // 细长比下限：高 / 宽（左上→左下 / 左上→右上）
+    int gray_thres = 113;           // 灰度下限，像素 > 该值视为前景；播放时可调
+    int min_height_width = 1.5;       // 细长比下限：高 / 宽（左上→左下 / 左上→右上）
     int max_height_width = 15;      // 细长比上限，过瘦噪声丢掉
 };
 
