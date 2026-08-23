@@ -7,7 +7,7 @@
  * 原理概要：
  * 灯条是高亮、近竖直的细长色块。先把 BGR 转灰度，大于 gray_thres 的像素为前景，
  * 闭运算补小缺口，再找外轮廓。用旋转矩形四顶点计算高（左上→左下）、
- * 宽（右上→右下）。细长比用高/顶边（左上→右上），因为右上→右下与高是对边。
+ * 宽（左上→右上）。细长比用 height/width。倾角用 |tan_xy|（右上→右下的 Δx/Δy）。
  * 颜色不看 HSV：在旋转矩形内、且落在二值前景上的像素，R>B 计红面积、B>R 计蓝面积，
  * 红面积更大判红，蓝面积更大判蓝。
  */
@@ -21,7 +21,8 @@ namespace {
 
 constexpr int kMinArea = 40;     // 旋转矩形面积下限，滤掉碎点
 constexpr int kMaxArea = 3500;   // 面积上限，滤掉大块误分割
-const double kMaxAbsAngle = 25.0;  // 高边相对竖直的倾角门限（度）
+// |tan_xy| 上限 ≈ tan(25°)。近水平时 dy 很小、|tan_xy| 会被放大，正好丢掉。
+const float kMaxAbsTanXy = std::tan(25.0 * CV_PI / 180.0);
 
 }  // namespace
 
@@ -51,9 +52,8 @@ cv::Mat LightDetector::get_bin(const cv::Mat& frame) const {
 int LightDetector::classifyColorRgb(const cv::Mat& r_gt_b, const cv::Mat& b_gt_r,
                                     const cv::Mat& bin, const cv::Point2f pts[4]) const {
     // 只在「框内且过灰度阈值」的像素上比 R/B，避免框里背景把颜色带偏。
-    cv::Point ipts[4];
-    for (int i = 0; i < 4; ++i)
-        ipts[i] = pts[i];
+    // pts 存的是 左上/右上/左下/右下，填凸包必须绕序，否则交叉。
+    const cv::Point ipts[4] = {pts[0], pts[1], pts[3], pts[2]};
 
     cv::Mat poly = cv::Mat::zeros(bin.size(), CV_8UC1);
     cv::fillConvexPoly(poly, ipts, 4, 255);
@@ -109,11 +109,10 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         if (light.height <= 1e-6)
             continue;
 
-        // 细长比 = 高 / 顶边。右上→右下与高是对边，不能用来筛。
-        const double short_side = light.top_width();
-        if (short_side <= 1e-6)
+        // 细长比 = 高 / 宽。宽已是短边（左上→右上）。
+        if (light.width <= 1e-6)
             continue;
-        const double ratio = light.height / short_side;
+        const double ratio = light.height / light.width;
         if (ratio < min_ratio || ratio > max_ratio)
             continue;
 
@@ -121,7 +120,7 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         if (area < kMinArea || area > kMaxArea)
             continue;
 
-        if (std::fabs(light.angle) > kMaxAbsAngle)
+        if (std::fabs(light.tan_xy) > kMaxAbsTanXy)
             continue;
 
         light.color = classifyColorRgb(r_gt_b, b_gt_r, bin, light.pts);

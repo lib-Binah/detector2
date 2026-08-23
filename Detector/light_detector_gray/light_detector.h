@@ -15,8 +15,8 @@
  */
 struct LightParams {
     int gray_thres = 180;           // 灰度下限，像素 > 该值视为前景；播放时可调
-    int min_height_width = 1;       // 细长比下限：高 / 顶边（左上→右上）
-    int max_height_width = 10;      // 细长比上限，过瘦噪声丢掉
+    int min_height_width = 3;       // 细长比下限：高 / 宽（左上→左下 / 左上→右上）
+    int max_height_width = 15;      // 细长比上限，过瘦噪声丢掉
 };
 
 class LightDetector {

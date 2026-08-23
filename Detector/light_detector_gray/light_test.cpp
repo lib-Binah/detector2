@@ -1,13 +1,14 @@
 /**
  * @file light_test.cpp
- * @brief 灰度灯条检测的双窗口播放调试
+ * @brief 灰度灯条检测的多窗口播放调试
  *
  * 注释契约：禁止随意删除本文件注释；改窗口布局、HUD 内容、进度条或快捷键时必须改注释。
  *
- * 两个窗口：
- *   displayimg          原图+旋转矩形及四行数字；画面外顶栏左=帧率/灰度均值，
- *                       右=鼠标 HSV RGB 灰度 xy（只写数值，字粗 1）；frame/gray 进度条
+ * 三个窗口：
+ *   displayimg          原图+旋转矩形及可选标注；画面外顶栏左=FPS/整帧灰度均值（带标签），
+ *                       右=鼠标 HSV RGB Gray xy（带类型标签，字粗 1）；frame/gray 进度条
  *   Frame with Lights   上半原图+框（无数字），下半灰度二值；整体缩到不超过 1920x1080
+ *   light overlay       0/1 进度条：是否在 displayimg 上画灯条高/宽/细长比/tan_xy/颜色
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
  */
@@ -47,6 +48,14 @@ constexpr int kMaxWinH = 1080;         // 窗口内容高上限，含拼接后�
 constexpr int kGrayThresDefault = 180; // 与 LightParams::gray_thres 默认一致
 
 int gray_thres = kGrayThresDefault;
+
+// light overlay 窗的 0/1 进度条：只改 displayimg 上的文字，不改检测。
+// 默认全开，和原先四行都画一致。GTK 进度条下限是 0，所以用 int 而不是 bool。
+int overlay_h = 1;      // 高：左上→左下（Light::height）
+int overlay_w = 1;      // 宽：左上→右上（Light::width）
+int overlay_ratio = 1;  // 细长比 height/width
+int overlay_ang = 1;    // tan_xy（右上→右下 Δx/Δy）
+int overlay_color = 1;  // red / blue / ?
 
 /** 只在真正播到新帧时更新，暂停时沿用上次，避免 waitKey 循环把 FPS 打满。 */
 void updateFps(double& fps, bool enabled) {
@@ -168,18 +177,22 @@ void processLights(const Mat& raw, LightDetector& detector, Mat& bin,
 }
 
 /**
- * 主窗口画面内四行（字粗 1）：
- *   高x宽 = 左上-左下 × 右上-右下
- *   高:宽 = 高 / 顶边（细长比；对边比接近 1，不能当这一行）
- *   夹角（度）、red/blue
+ * 主窗口画面内按 overlay_* 开关逐行画（字粗 1，带标签；关掉某一行就上移，不留空行）：
+ *   H     = Light::height（左上→左下）
+ *   W     = Light::width（左上→右上）
+ *   ratio = height / width
+ *   tan   = Light::tan_xy（右上→右下 Δx/Δy）
+ *   color = red / blue / ?
  */
 void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
+    const int line_h = 12;
     for (const auto& light : lights) {
-        const double short_side = light.top_width();
-        const string size_text = cv::format("%.1fx%.1f", light.height, light.width);
-        const string ratio_text =
-            cv::format("%.2f", short_side > 1e-6 ? light.height / short_side : 0.0);
-        const string ang_text = cv::format("%.1f", light.angle);
+        const int nlines = (overlay_h ? 1 : 0) + (overlay_w ? 1 : 0) +
+                           (overlay_ratio ? 1 : 0) + (overlay_ang ? 1 : 0) +
+                           (overlay_color ? 1 : 0);
+        if (nlines == 0)
+            continue;
+
         string color_text = "?";
         Scalar color_scalar(0, 255, 255);
         if (light.color == 1) {
@@ -191,21 +204,56 @@ void drawLightRotatedInfo(Mat& img, const std::vector<Light>& lights) {
         }
 
         Point org(cvRound(light.center().x + 6), cvRound(light.center().y));
-        org.x = std::clamp(org.x, 2, std::max(2, img.cols - 80));
-        org.y = std::clamp(org.y, 12, std::max(12, img.rows - 52));
-        putText(img, size_text, org, FONT_HERSHEY_PLAIN, 0.9, Scalar(0, 255, 255),
-                kFontThick, LINE_AA);
-        putText(img, ratio_text, Point(org.x, org.y + 12), FONT_HERSHEY_PLAIN, 0.9,
-                Scalar(0, 255, 255), kFontThick, LINE_AA);
-        putText(img, ang_text, Point(org.x, org.y + 24), FONT_HERSHEY_PLAIN, 0.9,
-                Scalar(0, 255, 255), kFontThick, LINE_AA);
-        putText(img, color_text, Point(org.x, org.y + 36), FONT_HERSHEY_PLAIN, 0.9,
-                color_scalar, kFontThick, LINE_AA);
+        org.x = std::clamp(org.x, 2, std::max(2, img.cols - 110));
+        org.y = std::clamp(org.y, 12, std::max(12, img.rows - line_h * nlines - 4));
+
+        int y = org.y;
+        if (overlay_h) {
+            putText(img, cv::format("H:%.1f", light.height), Point(org.x, y),
+                    FONT_HERSHEY_PLAIN, 0.9, Scalar(0, 255, 255), kFontThick, LINE_AA);
+            y += line_h;
+        }
+        if (overlay_w) {
+            putText(img, cv::format("W:%.1f", light.width), Point(org.x, y),
+                    FONT_HERSHEY_PLAIN, 0.9, Scalar(0, 255, 255), kFontThick, LINE_AA);
+            y += line_h;
+        }
+        if (overlay_ratio) {
+            putText(img, cv::format("ratio:%.2f", light.hw_ratio()), Point(org.x, y),
+                    FONT_HERSHEY_PLAIN, 0.9, Scalar(0, 255, 255), kFontThick, LINE_AA);
+            y += line_h;
+        }
+        if (overlay_ang) {
+            putText(img, cv::format("tan:%.2f", light.tan_xy), Point(org.x, y),
+                    FONT_HERSHEY_PLAIN, 0.9, Scalar(0, 255, 255), kFontThick, LINE_AA);
+            y += line_h;
+        }
+        if (overlay_color) {
+            putText(img, color_text, Point(org.x, y), FONT_HERSHEY_PLAIN, 0.9,
+                    color_scalar, kFontThick, LINE_AA);
+        }
     }
 }
 
 /**
- * 顶栏画在画面外：左=帧率、整帧灰度均值；右=H S V  R G B  Gray  x y（无标签）。
+ * overlay 窗的说明图：进度条名字太短，用画面写清 0/1 含义和几何定义。
+ * Hershey 无中文。每帧 imshow 一次，避免空窗被部分后端丢掉。
+ */
+Mat makeOverlayLegend() {
+    Mat panel(72, 440, CV_8UC3, Scalar(28, 28, 28));
+    putText(panel, "0=hide  1=show   (displayimg only)", Point(8, 20),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
+    putText(panel, "H=TL-BL  W=TL-TR  ratio=H/W", Point(8, 42),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    putText(panel, "tan=dx/dy(TR-BR)  color=red/blue", Point(8, 64),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    return panel;
+}
+
+/**
+ * 顶栏画在画面外（带类型标签，Hershey 无中文所以用英文）：
+ *   左 = FPS（帧率）+ meanGray（整帧灰度均值）
+ *   右 = HSV(H∈[0,180]) RGB Gray xy（鼠标处像素，相对原图）
  * 十字丝画在画面内鼠标处，数字不叠在图上。
  */
 Mat makeDisplayCanvas(const Mat& vis, double fps, double mean_gray) {
@@ -213,7 +261,7 @@ Mat makeDisplayCanvas(const Mat& vis, double fps, double mean_gray) {
     vis.copyTo(canvas(Rect(0, kHudH, vis.cols, vis.rows)));
     display_hud_h = kHudH;
 
-    const string left = cv::format("%.1f  %.1f", fps, mean_gray);
+    const string left = cv::format("FPS:%.1f  meanGray:%.1f", fps, mean_gray);
     putText(canvas, left, Point(8, 24), FONT_HERSHEY_SIMPLEX, 0.55,
             Scalar(0, 200, 100), kFontThick, LINE_AA);
 
@@ -221,7 +269,7 @@ Mat makeDisplayCanvas(const Mat& vis, double fps, double mean_gray) {
         const int r = mouse_bgr[2];
         const int g = mouse_bgr[1];
         const int b = mouse_bgr[0];
-        const string right = cv::format("%d %d %d  %d %d %d  %d  %d %d",
+        const string right = cv::format("HSV:(%d,%d,%d)  RGB:(%d,%d,%d)  Gray:%d  xy:(%d,%d)",
                                         static_cast<int>(hsv_value[0]),
                                         static_cast<int>(hsv_value[1]),
                                         static_cast<int>(hsv_value[2]),
@@ -317,12 +365,20 @@ int main() {
 
     const string win_display = "displayimg";
     const string win_combined = "Frame with Lights";
+    const string win_overlay = "light overlay";
     namedWindow(win_display);
     namedWindow(win_combined);
+    namedWindow(win_overlay);
     setMouseCallback(win_display, onMouseDisplay, nullptr);
     setMouseCallback(win_combined, onMouseCombined, nullptr);
     createTrackbar("frame", win_display, nullptr, trackbar_max, onFrameTrackbar, &scrubber);
     createTrackbar("gray", win_display, &gray_thres, 255);
+    // overlay 全是 0/1：只控制 displayimg 文字，不触发重检。max 必须 >=1（GTK）。
+    createTrackbar("H", win_overlay, &overlay_h, 1);
+    createTrackbar("W", win_overlay, &overlay_w, 1);
+    createTrackbar("ratio", win_overlay, &overlay_ratio, 1);
+    createTrackbar("tan", win_overlay, &overlay_ang, 1);
+    createTrackbar("color", win_overlay, &overlay_color, 1);
 
     auto syncTrackbar = [&]() {
         scrubber.syncing = true;
@@ -402,6 +458,7 @@ int main() {
         combined_y_offset = vis_plain.rows;
         Mat shown_combined = scaleTo1080(combined, &combined_scale);
         imshow(win_combined, shown_combined);
+        imshow(win_overlay, makeOverlayLegend());
 
         const int key = waitKeyEx(15);
         if (key < 0)

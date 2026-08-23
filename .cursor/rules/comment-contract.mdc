@@ -17,9 +17,9 @@ alwaysApply: true
 
 ```cpp
 // ❌ BAD：删掉契约和原理，只留实现
-height = cv::norm(pts[0] - pts[3]);
+height = cv::norm(pts[0] - pts[2]);
 
 // ✅ GOOD：保留并在改公式时改注释
 // 高：左上 → 左下。改顶点顺序时必须同步改本句。
-height = cv::norm(pts[0] - pts[3]);
+height = cv::norm(pts[0] - pts[2]);
 ```
