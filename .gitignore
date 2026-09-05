@@ -13,6 +13,10 @@ Debug/
 Release/
 .cache/
 
+# ros2_ws 下每个子目录都是独立 colcon 工作空间；只忽略编译产物
+ros2_ws/*/install/
+ros2_ws/*/log/
+
 # 编译产物
 *.o
 *.obj
