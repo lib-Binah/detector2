@@ -313,6 +313,8 @@ int main() {
         "Infantry_blue.avi",
         "Infantry_red1.avi",
         "Infantry_red2.avi",
+        "2026_10.mp4",
+         "2026_TDT_4.mp4"
     };
     const string prefixes[] = {
         "../../Video/",
@@ -322,9 +324,9 @@ int main() {
     };
 
     int i = 0;
-    std::cout << "请输入0-4,按照Video目录顺序选取视频: ";
+    std::cout << "请输入数字,按照Video目录顺序选取视频: ";
     cin >> i;
-    if (i < 0 || i > 4) {
+    if (i < 0 || i > names->length()-1) {
         cout << "Invalid index\n";
         return -1;
     }
