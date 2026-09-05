@@ -7,11 +7,12 @@
  * 计算方式相同；禁止显示时另算中心距或长度比。灯条框仍读 Light 字段。
  * 每个函数须写清作用、输入、输出；调用处也要注明。
  *
- * 三个窗口：
- *   displayimg          原图+灯条框+装甲板框及可选标注；顶栏 FPS/meanGray；frame/gray 进度条
- *                       画面按 1920×1080 可用区域缩小（已扣标题栏和 4 条进度条）
+ * 四个窗口：
+ *   displayimg          原图+灯条框+装甲板框及可选标注；顶栏 FPS/meanGray；只留 frame 进度条
+ *                       画面按 1920×1080 可用区域缩小（已扣标题栏和 1 条进度条）
  *   Frame with Armors   上半原图+框（无数字），下半灰度二值；上下拼接后约 2 倍帧高，
  *                       整体缩到不超过 1920×1080（已扣标题栏/底栏，与 displayimg 同一套上限）
+ *   armor params        gray / color / conf：灰度阈值、配色、CNN 置信度门槛（从大窗拆出，避免挤占画面）
  *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 板倾角 / 灯条倾角差 / 数字 / 置信度 / 距离
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
@@ -49,7 +50,7 @@ constexpr int kWinChromeW = 40;        // 左右边框，避免贴齐 1920 仍�
 constexpr int kWinTitleH = 40;         // 标题栏
 constexpr int kTaskbarH = 48;          // 屏幕底栏余量，大窗贴底会被挡住
 constexpr int kTrackbarH = 46;         // GTK 一条进度条大约高度
-constexpr int kDisplayTrackbars = 4;   // displayimg：frame / gray / color / conf
+constexpr int kDisplayTrackbars = 1;   // displayimg 只留 frame；gray/color/conf 在 armor params
 
 int gray_thres = LightParams::kGrayThresDefault;
 int detect_color = 0;     // 0=红蓝都配，1=只红，2=只蓝；与 ArmorParams::detect_color 同源
@@ -113,7 +114,7 @@ bool isRightKey(int key) {
  * 原理：WINDOW_AUTOSIZE 的窗高 = 图高 + 进度条；组合大窗上下拼接约 2 倍帧高，
  * 若不扣标题栏/底栏/进度条，图本身缩到 1080 后整窗仍会超出屏幕。
  * 输入：img 任意尺寸；scale_out 非空时写出缩放比；n_trackbars 为该窗进度条条数
- * （displayimg 为 4，Frame with Armors 为 0）。
+ * （displayimg 为 1，Frame with Armors 为 0；gray/color/conf 不在大窗上）。
  * 输出：缩小后的图，或原图（扣完装饰后仍不超过上限）。
  */
 Mat scaleTo1080(const Mat& img, double* scale_out, int n_trackbars) {
@@ -267,7 +268,7 @@ void drawNumberThumbnails(Mat& img, const std::vector<ArmorBoard>& armors) {
  * 输入：无。输出：BGR 说明图，每帧 imshow，避免空窗被后端丢掉。
  */
 Mat makeOverlayLegend() {
-    Mat panel(182, 520, CV_8UC3, Scalar(28, 28, 28));
+    Mat panel(160, 520, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "0=hide  1=show   (displayimg only)", Point(8, 22),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
     putText(panel, "type=SMALL/LARGE from center_distance", Point(8, 44),
@@ -280,9 +281,25 @@ Mat makeOverlayLegend() {
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "num/conf=CNN 1-8  dist=PnP ||t|| meters", Point(8, 132),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "color 0=both 1=red 2=blue   conf=CNN must >N%", Point(8, 154),
-            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
-    putText(panel, "H/angle=Light fields  same as matching", Point(8, 176),
+    putText(panel, "H/angle=Light fields  same as matching", Point(8, 154),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
+    return panel;
+}
+
+/**
+ * 作用：给 armor params 窗写 gray/color/conf 的含义（进度条名字太短）。
+ * 输入：无。输出：BGR 说明图，每帧 imshow，避免空窗被后端丢掉。
+ * 原理：这三项从 displayimg 拆出，检测仍读同一全局变量，只是进度条换窗。
+ */
+Mat makeParamsLegend() {
+    Mat panel(110, 520, CV_8UC3, Scalar(28, 28, 28));
+    putText(panel, "gray=Light gray thres  (get_bin)", Point(8, 22),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    putText(panel, "color 0=both 1=red 2=blue  (ArmorParams)", Point(8, 44),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    putText(panel, "conf=CNN must >N%  (classifier_threshold)", Point(8, 66),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    putText(panel, "same fields as matching / classify", Point(8, 88),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
     return panel;
 }
@@ -395,14 +412,16 @@ int main() {
 
     const string win_display = "displayimg";
     const string win_combined = "Frame with Armors";
+    const string win_params = "armor params";
     const string win_overlay = "armor overlay";
-    namedWindow(win_display);  // 带 4 条进度条，保持 AUTOSIZE，尺寸由缩放后的图画布决定
+    namedWindow(win_display);  // 只留 frame，保持 AUTOSIZE，尺寸由缩放后的图画布决定
     namedWindow(win_combined, WINDOW_NORMAL);  // 组合大窗：允许 resizeWindow 钉在 1920×1080 内
+    namedWindow(win_params);  // gray/color/conf 从大窗拆到这里，避免 3 条进度条占画面高度
     namedWindow(win_overlay);
     createTrackbar("frame", win_display, nullptr, trackbar_max, onFrameTrackbar, &scrubber);
-    createTrackbar("gray", win_display, &gray_thres, 255);
-    createTrackbar("color", win_display, &detect_color, 2);  // 0 both / 1 red / 2 blue
-    createTrackbar("conf", win_display, &conf_thres_pct, 100);
+    createTrackbar("gray", win_params, &gray_thres, 255);  // 灯条 get_bin 灰度门槛
+    createTrackbar("color", win_params, &detect_color, 2);  // 0 both / 1 red / 2 blue
+    createTrackbar("conf", win_params, &conf_thres_pct, 100);  // CNN 须严格大于该百分比
     createTrackbar("type", win_overlay, &overlay_type, 1);
     createTrackbar("lr", win_overlay, &overlay_lr, 1);
     createTrackbar("cd", win_overlay, &overlay_cd, 1);
@@ -485,7 +504,7 @@ int main() {
 
         const double mean_gray = current_gray.empty() ? 0.0 : mean(current_gray)[0];
         Mat display_canvas = makeDisplayCanvas(vis_info, is_show_fps ? fps : 0.0, mean_gray);
-        // displayimg 有 4 条进度条，扣掉后再缩到 1920×1080 可用区域
+        // displayimg 只留 frame 一条进度条，扣掉后再缩到 1920×1080 可用区域
         Mat shown_display = scaleTo1080(display_canvas, &display_scale, kDisplayTrackbars);
         imshow(win_display, shown_display);
 
@@ -504,6 +523,7 @@ int main() {
         Mat shown_combined = scaleTo1080(combined, &combined_scale, 0);
         imshow(win_combined, shown_combined);
         resizeWindow(win_combined, shown_combined.cols, shown_combined.rows);  // 钉死缩放后尺寸，GTK AUTOSIZE 有时不随图缩小
+        imshow(win_params, makeParamsLegend());  // 无输入 → gray/color/conf 说明图
         imshow(win_overlay, makeOverlayLegend());
 
         const int key = waitKeyEx(15);
