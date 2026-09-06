@@ -35,7 +35,8 @@ struct ArmorParams {
     double max_light_angle_diff = 10.0;
     // 0=红蓝都配（同色对），1=只红，2=只蓝。clone_detector 默认锁一色；调试默认都要。
     int detect_color = 0;
-    // CNN softmax 门槛：confidence 必须严格大于该值才保留（默认 kMinConfidence=0.80）。播放进度条会改它。
+    // CNN softmax 门槛：confidence 必须严格大于该值才保留（默认 kMinConfidence=0.80）。
+    // 播放器 conf 进度条只改这一项；数字 6 走 NumberClassifier::digit6_threshold_，不读本字段。
     float classifier_threshold = NumberClassifier::kMinConfidence;
 };
 

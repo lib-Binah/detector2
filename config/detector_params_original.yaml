@@ -79,8 +79,10 @@ armor:
   max_light_angle_diff: 10.0
   # 0=红蓝都配。
   detect_color: 0
-  # CNN 置信度须严格大于该值。
+  # CNN 置信度须严格大于该值。数字 6 不读这项。
   classifier_threshold: 0.80
+  # 装甲数字 6 单独门槛 60%，不随 conf。
+  classifier_threshold_digit6: 0.60
 
 # ---------- 数字透视 ROI ----------
 number:

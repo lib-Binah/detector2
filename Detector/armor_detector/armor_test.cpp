@@ -14,7 +14,7 @@
  *   Frame with Armors   上半原图+框（无数字），下半灰度二值；上下拼接后约 2 倍帧高，
  *                       整体缩到不超过 1920×1080（已扣标题栏/底栏，与 displayimg 同一套上限）
  *   armor params        gray / hsv_f / color / conf：灰度阈值、HSV 占比过滤、配色、CNN 置信度
- *                       （从大窗拆出，避免挤占画面）
+ *                       （conf 不含数字 6，数字 6 固定 60%；从大窗拆出，避免挤占画面）
  *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 板倾角 / 灯条倾角差 / 数字 / 置信度 / 距离
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
@@ -59,7 +59,7 @@ constexpr int kDisplayTrackbars = 1;   // displayimg 只留 frame；gray/color/c
 int gray_thres = LightParams::kGrayThresDefault;
 int hsv_filter = 1;       // 1=按 Light::hsv_ratio 丢灯，0=关；与 LightParams::use_hsv_filter 同源
 int detect_color = 0;     // 0=红蓝都配，1=只红，2=只蓝；与 ArmorParams::detect_color 同源
-int conf_thres_pct = 80;  // CNN 置信度门槛 ×100（须大于该值）；写入 classifier_threshold，默认 80%
+int conf_thres_pct = 80;  // CNN 置信度门槛 ×100（须大于该值）；写入 classifier_threshold；数字 6 不读这项
 
 // overlay 0/1：只改 displayimg 文字，不改检测。GTK 进度条下限是 0。
 int overlay_type = 1;   // ArmorBoard::type
@@ -298,16 +298,18 @@ Mat makeOverlayLegend() {
  * 原理：这几项从 displayimg 拆出，检测仍读同一全局变量，只是进度条换窗。
  */
 Mat makeParamsLegend() {
-    Mat panel(132, 520, CV_8UC3, Scalar(28, 28, 28));
+    Mat panel(154, 520, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "gray=Light gray thres  (get_bin)", Point(8, 22),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "hsv_f 0=off 1=on  (HSV ratio gate, Light.hsv_ratio)", Point(8, 44),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "color 0=both 1=red 2=blue  (ArmorParams)", Point(8, 66),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "conf=CNN must >N%  (classifier_threshold)", Point(8, 88),
+    putText(panel, "conf=CNN must >N%  (not digit 6)", Point(8, 88),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "same fields as matching / classify", Point(8, 110),
+    putText(panel, "digit6 gate=60% fixed  (classifier_threshold_digit6)", Point(8, 110),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    putText(panel, "same fields as matching / classify", Point(8, 132),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
     return panel;
 }
@@ -451,7 +453,7 @@ int main(int argc, char** argv) {
     createTrackbar("gray", win_params, &gray_thres, 255);  // 灯条 get_bin 灰度门槛
     createTrackbar("hsv_f", win_params, &hsv_filter, 1);  // 0=关 HSV 占比过滤，1=开
     createTrackbar("color", win_params, &detect_color, 2);  // 0 both / 1 red / 2 blue
-    createTrackbar("conf", win_params, &conf_thres_pct, 100);  // CNN 须严格大于该百分比
+    createTrackbar("conf", win_params, &conf_thres_pct, 100);  // CNN 须严格大于该百分比；数字 6 固定 60%
     createTrackbar("type", win_overlay, &overlay_type, 1);
     createTrackbar("lr", win_overlay, &overlay_lr, 1);
     createTrackbar("cd", win_overlay, &overlay_cd, 1);

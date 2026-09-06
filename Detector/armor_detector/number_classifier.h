@@ -9,6 +9,7 @@
 
 /**
  * 注释契约：禁止为“精简”删除本文件注释；改输入尺寸、归一化、类别映射或拒识规则时必须改注释。
+ * 数字 6（索引 5）置信度门槛单独为 digit6_threshold_，不跟 conf。
  * CNN 输入：20×28 单通道（默认 Otsu 二值，可在 yaml number.use_binary 关掉）、
  * (x/255-0.5)/0.5、NCHW [1,1,28,20]。类别 0~7 → 数字 1~8，类别 8 → other。
  * 每个函数须写清作用、输入、输出；调用处也要注明。
@@ -21,10 +22,13 @@
 class NumberClassifier {
 public:
     static constexpr int kOtherClass = 8;     // 第 9 类：不是 1~8
+    static constexpr int kDigit6Class = 5;    // softmax 索引 5 → 装甲数字 6
     static constexpr int kInputW = 20;        // 与训练 resize 宽一致
     static constexpr int kInputH = 28;        // 与训练 resize 高一致
-    // softmax 最大类概率必须严格大于该值才算装甲板（默认 80%）。改门槛时同步改本注释。
+    // softmax 最大类概率必须严格大于该值才算装甲板（默认 80%）。播放器 conf 改的是这一项。
     static constexpr float kMinConfidence = 0.80f;
+    // 数字 6 单独门槛（60%），不跟 conf 进度条；yaml armor.classifier_threshold_digit6 可覆盖。
+    static constexpr float kMinConfidenceDigit6 = 0.60f;
 
     /**
      * 作用：空分类器，尚未读模型；classify 会原样留下装甲板。
@@ -65,8 +69,15 @@ public:
     void extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard>& armors) const;
 
     /**
+     * 作用：写入数字 6 的置信度门槛（不跟 conf 进度条）。
+     * 输入：t 为 (0,1] 概率；内部夹到合理范围。输出：无；classify 读 digit6_threshold_。
+     */
+    void setDigit6Threshold(float t);
+
+    /**
      * 作用：对 number_img 做 CNN 前向；other / 置信度未严格大于门槛 / 大板非 1 或小板为 1 的板丢掉。
-     * 输入：armors 须已 extractNumbers；threshold 为置信度门槛（须 confidence > threshold）。
+     * 输入：armors 须已 extractNumbers；threshold 为除数字 6 外的置信度门槛（须 confidence > threshold）。
+     *      数字 6（kDigit6Class）改用 digit6_threshold_（默认 0.60），不读本参数。
      * 输出：就地删除未通过的板；通过的写入 number/confidence/classification_result。
      */
     void classify(std::vector<ArmorBoard>& armors, float threshold);
@@ -81,6 +92,7 @@ private:
     cv::dnn::Net net_;
     bool loaded_ = false;
     bool use_binary_ = true;        // true：Otsu 二值写入 number_img 并送 CNN；yaml number.use_binary
+    float digit6_threshold_ = kMinConfidenceDigit6;  // 数字 6 固定门槛；不随 classifier_threshold / conf
     int light_length_ = 12;         // 透视条带里灯条竖向像素，与 yaml number.light_length 同源
     int warp_height_ = 28;          // 条带总高
     int small_armor_width_ = 32;    // 小板条带宽

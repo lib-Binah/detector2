@@ -18,6 +18,8 @@
  * + 可选的对应色 HSV 面积比门限（红/蓝下限分开，use_hsv_filter 关掉则不算过滤）。
  * 红灯 H 为两段 OR：low 与 high（配置 red_h_*_low / red_h_*_high），因为 OpenCV H 在 0/180 环绕。
  * 过曝灯芯在灰度上仍是高亮，单阈值即可接住；HSV 只做二次确认，不代替灰度找轮廓。
+ * RGB 投票和 HSV 占比在灯条四顶点的轴对齐包围盒 ROI 上计算：像素判定与整图填凸包相同，
+ * 避免每帧整图 BGR2HSV/inRange、以及每根灯 zeros(整图)。
  * hsv_ratio 始终写入 Light，筛选是否用它读 params_.use_hsv_filter；overlay 仍读同一字段。
  * 几何/HSV 数值默认来自 config/detector_params.yaml；缺文件时用下面结构体初值（与新配置一致）。
  */
@@ -139,29 +141,34 @@ public:
 private:
     /**
      * 作用：在灯条框 ∩ 灰度前景上，用 R>B / B>R 像素数投票判红蓝（不用 HSV）。
-     * 输入：r_gt_b、b_gt_r 为整帧比较掩码；bin 为 get_bin 结果；pts 为 Light 四顶点
-     *      （左上/右上/左下/右下，函数内会改成绕序再填凸包）。
+     * 输入：bgr 为当前帧；bin 为 get_bin 结果；pts 为 Light 四顶点
+     *      （左上/右上/左下/右下，函数内会改成绕序再在包围盒 ROI 上填凸包）。
      * 输出：1 红 / 2 蓝 / -1 票数相等或框内无前景（调用处丢掉）。
      */
-    int classifyColorRgb(const cv::Mat& r_gt_b, const cv::Mat& b_gt_r,
-                         const cv::Mat& bin, const cv::Point2f pts[4]) const;
+    int classifyColorRgb(const cv::Mat& bgr, const cv::Mat& bin, const cv::Point2f pts[4]) const;
 
     /**
-     * 作用：整帧 HSV 按 H/S/V 做 inRange。红可两段 H OR，蓝单段。
-     * 输入：hsv 为 COLOR_BGR2HSV 结果；p 为红或蓝 HsvParams。
+     * 作用：HSV 图按 H/S/V 做 inRange。红可两段 H OR，蓝单段。逐像素，整帧或 ROI 结果一致。
+     * 输入：hsv 为 COLOR_BGR2HSV 结果（可仅为灯条包围盒）；p 为红或蓝 HsvParams。
      * 输出：CV_8UC1，落在区间内为 255。
      */
     cv::Mat hsvMask(const cv::Mat& hsv, const HsvParams& p) const;
 
     /**
      * 作用：旋转矩形内、符合对应色 HSV 的像素占矩形栅格面积的比例，写入 Light::hsv_ratio。
-     * 输入：color_mask 为整帧红或蓝 hsvMask；pts 为 Light 四顶点（左上/右上/左下/右下，
-     *      函数内改成绕序再填凸包）。
+     * 输入：bgr 为当前帧；p 为已判定颜色的 HsvParams；pts 为 Light 四顶点（左上/右上/左下/右下，
+     *      函数内改成绕序，在包围盒 ROI 上填凸包；像素集合与整图填凸包相同）。
      * 输出：[0,1]；分母是 fillConvexPoly 非零像素，框面积为 0 时返回 0。
      */
-    double hsvRatioInRotatedRect(const cv::Mat& color_mask, const cv::Point2f pts[4]) const;
+    double hsvRatioInRotatedRect(const cv::Mat& bgr, const HsvParams& p,
+                                 const cv::Point2f pts[4]) const;
 
     LightParams params_;
     HsvParams red_params_;   // 红灯 HSV：H 低段或高段 OR，筛占比与 inRange 同源
     HsvParams blue_params_;  // 蓝灯 HSV：单段 H，筛占比与 inRange 同源
+    // get_bin 为 const，核缓存用 mutable：close_ksize 不变则不重建椭圆核。
+    mutable cv::Mat close_kernel_;
+    mutable int close_kernel_k_ = -1;
 };
+
+

@@ -49,6 +49,9 @@ bool ArmorDetector::loadConfig(const std::string& path) {
     readYaml(n, "max_light_angle_diff", params_.max_light_angle_diff);
     readYaml(n, "detect_color", params_.detect_color);
     readYaml(n, "classifier_threshold", params_.classifier_threshold);
+    float digit6 = NumberClassifier::kMinConfidenceDigit6;
+    readYaml(n, "classifier_threshold_digit6", digit6);
+    classifier_.setDigit6Threshold(digit6);  // 数字 6 单独门槛，conf 进度条不改这项
     classifier_.loadConfig(path);  // number 透视条带尺寸 + use_binary（Otsu 是否写入 number_img）
     return true;
 }
@@ -153,7 +156,7 @@ std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& ligh
     // 2) extractNumbers：四端点透视 → 20×28 → 可选 Otsu 二值，写入 number_img（与 CNN/左上角同源）。
     classifier_.extractNumbers(frame, armors);
 
-    // 3) classify：CNN softmax；other / 置信度未大于门槛 / 大板非 1 或小板为 1 的板删掉。没模型则跳过。
+    // 3) classify：CNN softmax；other / 置信度未大于门槛（数字 6 用固定 60%）/ 大板非 1 或小板为 1 的板删掉。没模型则跳过。
     if (classifier_.loaded())
         classifier_.classify(armors, params_.classifier_threshold);
 

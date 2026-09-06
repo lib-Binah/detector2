@@ -126,7 +126,7 @@ public:
             cv::createTrackbar("gray", win_, &gray_thres_, 255);   // 灯条 get_bin 灰度门槛
             cv::createTrackbar("hsv_f", win_, &hsv_filter_, 1);    // 0=关 HSV 占比过滤，1=开
             cv::createTrackbar("color", win_, &detect_color_, 2);  // 0 both / 1 red / 2 blue
-            cv::createTrackbar("conf", win_, &conf_thres_pct_, 100);  // CNN 须严格大于该百分比
+            cv::createTrackbar("conf", win_, &conf_thres_pct_, 100);  // CNN 须严格大于该百分比；数字 6 仍用 60%
         }
 
         RCLCPP_INFO(get_logger(), "订阅 %s，KeepLast(1)，按接收帧率检测", topic.c_str());

@@ -1,8 +1,9 @@
 /**
- * 注释契约：禁止随意删除本文件注释；改 warp 尺寸、归一化、类别映射或大小板矛盾规则时必须改注释。
+ * 注释契约：禁止随意删除本文件注释；改 warp 尺寸、归一化、类别映射、数字 6 门槛或大小板矛盾规则时必须改注释。
  * 每个函数须写清作用/输入/输出；OpenCV DNN / 透视调用处也要注明。
  *
  * 数字：灯条端点透视 → 20×28 → 可选 Otsu 二值 → (x/255-0.5)/0.5 → ONNX Softmax → 1~8 / other。
+ * 置信度：除数字 6 外须 > conf 门槛；数字 6（索引 5）须 > digit6_threshold_（默认 0.60），不跟 conf。
  * number_img 与 CNN 输入必须是同一张；改二值开关时 overlay 左上角跟着变。
  */
 #include "number_classifier.h"
@@ -29,6 +30,15 @@ bool NumberClassifier::loadModel(const std::string& model_path) {
         return false;
     loaded_ = true;
     return true;
+}
+
+/**
+ * 作用：写入数字 6 的置信度门槛。
+ * 输入：t。输出：无；夹到 (0,1]。
+ */
+void NumberClassifier::setDigit6Threshold(float t) {
+    // 数字 6 不跟 conf；yaml / 默认 0.60 走这里。
+    digit6_threshold_ = std::clamp(t, 1e-3f, 1.f);
 }
 
 /**
@@ -71,11 +81,15 @@ bool NumberClassifier::loadConfig(const std::string& path) {
  * 输入：单通道图（通常已是 20×28）。输出：[1,1,28,20] float。
  */
 cv::Mat NumberClassifier::preprocess(const cv::Mat& gray) const {
-    cv::Mat resized;
-    cv::resize(gray, resized, cv::Size(kInputW, kInputH), 0, 0, cv::INTER_NEAREST);  // 二值用最近邻，避免插出灰边
+    cv::Mat src;
+    // 已是 20×28 则不再 resize（extractNumbers 写出的 number_img 正是这个尺寸）。
+    if (gray.cols == kInputW && gray.rows == kInputH)
+        src = gray;
+    else
+        cv::resize(gray, src, cv::Size(kInputW, kInputH), 0, 0, cv::INTER_NEAREST);  // 二值用最近邻，避免插出灰边
 
     cv::Mat float_img;
-    resized.convertTo(float_img, CV_32F, 1.0 / 255.0);  // [0,255] → [0,1]
+    src.convertTo(float_img, CV_32F, 1.0 / 255.0);  // [0,255] → [0,1]
     // Normalize((0.5,),(0.5,))：(x-0.5)/0.5；二值会落到约 -1 和 +1。
     const cv::Mat normalized = (float_img - 0.5f) / 0.5f;
     return cv::dnn::blobFromImage(normalized);  // HWC → NCHW [1,1,28,20]
@@ -130,7 +144,8 @@ void NumberClassifier::extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard
 
 /**
  * 作用：CNN 分类；other / 置信度未严格大于门槛 / 大板数字不是 1 或小板数字是 1 则删除该板。
- * 输入：已 extract 的 armors；threshold 为概率门槛（须 confidence > threshold，默认 0.80）。
+ * 输入：已 extract 的 armors；threshold 为除数字 6 外的概率门槛（须 confidence > threshold）。
+ *      数字 6 改用 digit6_threshold_（默认 0.60），不读 threshold。
  * 输出：就地留下通过的板。
  */
 void NumberClassifier::classify(std::vector<ArmorBoard>& armors, float threshold) {
@@ -157,8 +172,9 @@ void NumberClassifier::classify(std::vector<ArmorBoard>& armors, float threshold
         const int cls = max_loc.x;
         armor.confidence = static_cast<float>(max_val);
 
-        // 必须严格大于门槛才当装甲板；等于 80% 也丢掉。overlay 读同一份 confidence。
-        if (cls == kOtherClass || armor.confidence <= threshold) {
+        // 数字 6：固定 digit6_threshold_（默认 60%），不跟 conf。其余类仍须严格大于 threshold。
+        const float gate = (cls == kDigit6Class) ? digit6_threshold_ : threshold;
+        if (cls == kOtherClass || armor.confidence <= gate) {
             armor.number = 0;
             armor.classification_result = "other";
             continue;

@@ -17,6 +17,7 @@
  * 红面积更大判红，蓝面积更大判蓝。
  * 再按已判颜色做 HSV 二次确认：旋转矩形内 inRange(红=red_params_ / 蓝=blue_params_)
  * 的像素占矩形栅格面积的比例写入 Light::hsv_ratio（overlay 同源，关过滤也写）。
+ * RGB / HSV 都在四顶点轴对齐包围盒 ROI 上算，像素集合与整图填凸包相同，避免整图 inRange。
  * use_hsv_filter 为 true 时：红须大于 params_.hsv_ratio_min_red，蓝须大于 hsv_ratio_min_blue 才保留；
  * 为 false 时不按占比丢灯条。HSV 不代替灰度找轮廓。
  * 红 H：low 与 high 两段 OR（缺配置时与 detector_params.yaml 一致：0–35 或 156–180）。
@@ -39,6 +40,43 @@ int oddKsize(int k) {
     if (k % 2 == 0)
         ++k;
     return k;
+}
+
+/**
+ * 作用：Light::pts（左上/右上/左下/右下）→ fillConvexPoly 绕序整数点。
+ * 输入：pts 四顶点。输出：ipts = 左上→右上→右下→左下。
+ */
+void woundOrderPts(const cv::Point2f pts[4], cv::Point ipts[4]) {
+    ipts[0] = pts[0];
+    ipts[1] = pts[1];
+    ipts[2] = pts[3];  // 右下
+    ipts[3] = pts[2];  // 左下
+}
+
+/**
+ * 作用：四顶点 AABB 与图像求交，把点变到 ROI 坐标。
+ * 原理：凸包落在其轴对齐盒内；ROI 上 fillConvexPoly 的像素 = 整图填凸包 ∩ 该盒。
+ * 输入：图像尺寸、绕序整数四点。输出：true 并写出 roi / ipts_roi；盒空则 false。
+ */
+bool clipPtsToRoi(const cv::Size& img_size, const cv::Point ipts[4],
+                  cv::Rect& roi, cv::Point ipts_roi[4]) {
+    int x0 = ipts[0].x;
+    int y0 = ipts[0].y;
+    int x1 = ipts[0].x;
+    int y1 = ipts[0].y;
+    for (int i = 1; i < 4; ++i) {
+        x0 = std::min(x0, ipts[i].x);
+        y0 = std::min(y0, ipts[i].y);
+        x1 = std::max(x1, ipts[i].x);
+        y1 = std::max(y1, ipts[i].y);
+    }
+    const cv::Rect box(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+    roi = box & cv::Rect(0, 0, img_size.width, img_size.height);
+    if (roi.width <= 0 || roi.height <= 0)
+        return false;
+    for (int i = 0; i < 4; ++i)
+        ipts_roi[i] = cv::Point(ipts[i].x - roi.x, ipts[i].y - roi.y);
+    return true;
 }
 
 }  // namespace
@@ -159,35 +197,53 @@ cv::Mat LightDetector::get_bin(const cv::Mat& frame) const {
     cv::Mat bin;
     cv::threshold(gray, bin, params_.gray_thres, 255, cv::THRESH_BINARY);
 
-    // morphologyEx CLOSE：二值图 → 补上灯芯小黑洞；核太大会把邻近灯粘在一起。
+    // 椭圆闭运算核：k 不变则复用，避免每帧 getStructuringElement。
     const int k = oddKsize(params_.close_ksize);
-    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k, k));
-    cv::morphologyEx(bin, bin, cv::MORPH_CLOSE, kernel);
+    if (k != close_kernel_k_) {
+        close_kernel_ = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k, k));
+        close_kernel_k_ = k;
+    }
+    cv::morphologyEx(bin, bin, cv::MORPH_CLOSE, close_kernel_);
     return bin;  // CV_8UC1 前景 255
 }
 
 /**
  * 作用：在框 ∩ 灰度前景上用 R>B / B>R 像素数投票判红蓝（不用 HSV）。
- * 输入：整帧 r_gt_b/b_gt_r、get_bin 的 bin、Light 四顶点（左上/右上/左下/右下）。
- * 输出：1 红 / 2 蓝 / -1 丢掉。
+ * 输入：当前帧 BGR、get_bin 的 bin、Light 四顶点（左上/右上/左下/右下）。
+ * 输出：1 红 / 2 蓝 / -1 丢掉。只在包围盒 ROI 上 compare，像素集合与整图相同。
  */
-int LightDetector::classifyColorRgb(const cv::Mat& r_gt_b, const cv::Mat& b_gt_r,
-                                    const cv::Mat& bin, const cv::Point2f pts[4]) const {
+int LightDetector::classifyColorRgb(const cv::Mat& bgr, const cv::Mat& bin,
+                                    const cv::Point2f pts[4]) const {
     // 判色范围 = 旋转矩形 ∩ 灰度二值前景。
     // 只比框内灯芯像素的 R/B，避免框里装甲板、数字、背景把颜色带偏。
     // pts 存的是 左上/右上/左下/右下（不是绕序）；fillConvexPoly 必须按凸包绕序
     // 喂点，否则对角线交叉、填出来的不是灯条矩形。
-    const cv::Point ipts[4] = {pts[0], pts[1], pts[3], pts[2]};  // 左上→右上→右下→左下
+    cv::Point ipts[4];
+    woundOrderPts(pts, ipts);  // 左上→右上→右下→左下
+    cv::Rect roi;
+    cv::Point ipts_roi[4];
+    if (!clipPtsToRoi(bin.size(), ipts, roi, ipts_roi))
+        return -1;
 
-    // zeros+fillConvexPoly：四顶点 → 整图大小的凸包掩码（框内 255）。
-    cv::Mat poly = cv::Mat::zeros(bin.size(), CV_8UC1);
-    cv::fillConvexPoly(poly, ipts, 4, 255);
+    const cv::Mat bgr_roi = bgr(roi);
+    const cv::Mat bin_roi = bin(roi);
+
+    // zeros+fillConvexPoly：ROI 大小的凸包掩码（框内 255），与整图填凸包再裁盒相同。
+    cv::Mat poly = cv::Mat::zeros(roi.size(), CV_8UC1);
+    cv::fillConvexPoly(poly, ipts_roi, 4, 255);
 
     // bitwise_and：poly ∩ bin → 既在框内、又过灰度阈值的像素。
     cv::Mat inside;
-    cv::bitwise_and(poly, bin, inside);
+    cv::bitwise_and(poly, bin_roi, inside);
 
-    // r_gt_b / b_gt_r 是整帧「R>B / B>R」；与 inside 相与后只剩下灯芯上的偏红/偏蓝点。
+    // ROI 上 R>B / B>R：逐像素与整帧 compare 再裁切相同。
+    std::vector<cv::Mat> ch;
+    cv::split(bgr_roi, ch);  // 0=B, 1=G, 2=R
+    cv::Mat r_gt_b;
+    cv::Mat b_gt_r;
+    cv::compare(ch[2], ch[0], r_gt_b, cv::CMP_GT);
+    cv::compare(ch[0], ch[2], b_gt_r, cv::CMP_GT);
+
     cv::Mat red_mask;
     cv::Mat blue_mask;
     cv::bitwise_and(r_gt_b, inside, red_mask);
@@ -204,9 +260,9 @@ int LightDetector::classifyColorRgb(const cv::Mat& r_gt_b, const cv::Mat& b_gt_r
 }
 
 /**
- * 作用：整帧 HSV 按 H/S/V 做 inRange；红可两段 H 取并。
- * 输入：hsv 为 BGR2HSV 图；p 为红或蓝参数。
- * 输出：落在区间内的像素为 255。
+ * 作用：HSV 图按 H/S/V 做 inRange；红可两段 H 取并。
+ * 输入：hsv 为 BGR2HSV 图（整帧或灯条 ROI）；p 为红或蓝参数。
+ * 输出：落在区间内的像素为 255。逐像素，与图幅无关。
  */
 cv::Mat LightDetector::hsvMask(const cv::Mat& hsv, const HsvParams& p) const {
     cv::Mat mask_low;
@@ -230,17 +286,27 @@ cv::Mat LightDetector::hsvMask(const cv::Mat& hsv, const HsvParams& p) const {
 
 /**
  * 作用：旋转矩形内符合对应色 HSV 的像素占矩形栅格面积的比例。
- * 输入：整帧 color_mask、Light 四顶点（左上/右上/左下/右下）。
+ * 输入：当前帧 BGR、该色 HsvParams、Light 四顶点（左上/右上/左下/右下）。
  * 输出：[0,1]，供写入 Light::hsv_ratio；框栅格面积为 0 时返回 0。
+ * 只在包围盒 ROI 上 BGR2HSV + inRange，像素集合与整图掩码再裁切相同。
  */
-double LightDetector::hsvRatioInRotatedRect(const cv::Mat& color_mask,
+double LightDetector::hsvRatioInRotatedRect(const cv::Mat& bgr, const HsvParams& p,
                                             const cv::Point2f pts[4]) const {
     // pts 不是绕序；fillConvexPoly 必须按凸包绕序，否则对角线交叉。
-    const cv::Point ipts[4] = {pts[0], pts[1], pts[3], pts[2]};  // 左上→右上→右下→左下
+    cv::Point ipts[4];
+    woundOrderPts(pts, ipts);  // 左上→右上→右下→左下
+    cv::Rect roi;
+    cv::Point ipts_roi[4];
+    if (!clipPtsToRoi(bgr.size(), ipts, roi, ipts_roi))
+        return 0.0;
 
-    // zeros+fillConvexPoly：四顶点 → 整图大小的旋转矩形栅格掩码（框内 255）。
-    cv::Mat poly = cv::Mat::zeros(color_mask.size(), CV_8UC1);
-    cv::fillConvexPoly(poly, ipts, 4, 255);
+    cv::Mat hsv_roi;
+    cv::cvtColor(bgr(roi), hsv_roi, cv::COLOR_BGR2HSV);  // ROI BGR → HSV，H∈[0,180]
+    const cv::Mat color_mask = hsvMask(hsv_roi, p);       // 该色 inRange，仅 ROI
+
+    // zeros+fillConvexPoly：ROI 上的旋转矩形栅格掩码（框内 255）。
+    cv::Mat poly = cv::Mat::zeros(roi.size(), CV_8UC1);
+    cv::fillConvexPoly(poly, ipts_roi, 4, 255);
 
     // 分母用栅格像素数，保证占比落在 [0,1]，与 overlay 读的 hsv_ratio 同一套算法。
     const int poly_area = cv::countNonZero(poly);
@@ -260,7 +326,7 @@ double LightDetector::hsvRatioInRotatedRect(const cv::Mat& color_mask,
  */
 std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_out) {
     std::vector<Light> valid_lights;
-    // 后面 classifyColorRgb 要拆 B/R，灰度单通道不够。
+    // 后面 ROI 上 classifyColorRgb 要拆 B/R，灰度单通道不够。
     if (frame.empty() || frame.channels() != 3)
         return valid_lights;
 
@@ -268,20 +334,6 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
     const cv::Mat bin = get_bin(frame);
     if (bin_out)
         *bin_out = bin;
-
-    // split+compare：BGR 帧 → 整帧 r_gt_b(R>B)、b_gt_r(B>R)。每个轮廓只做与运算。
-    std::vector<cv::Mat> ch;
-    cv::split(frame, ch);  // 0=B, 1=G, 2=R
-    cv::Mat r_gt_b;
-    cv::Mat b_gt_r;
-    cv::compare(ch[2], ch[0], r_gt_b, cv::CMP_GT);
-    cv::compare(ch[0], ch[2], b_gt_r, cv::CMP_GT);
-
-    // cvtColor+hsvMask：BGR → 整帧红/蓝 HSV 掩码，每个轮廓只做框内占比，避免重复 inRange。
-    cv::Mat hsv;
-    cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);  // BGR 帧 → HSV，H∈[0,180]
-    const cv::Mat red_hsv = hsvMask(hsv, red_params_);    // 红 inRange
-    const cv::Mat blue_hsv = hsvMask(hsv, blue_params_);  // 蓝 inRange
 
     // clone：复制 bin，避免 findContours 改脏调试用的原图。
     // findContours：二值图 → 外轮廓列表（CHAIN_APPROX_SIMPLE 矩形可能只剩 4 点）。
@@ -316,14 +368,14 @@ std::vector<Light> LightDetector::get_lights(const cv::Mat& frame, cv::Mat* bin_
         if (std::fabs(light.angle) > params_.max_abs_angle)
             continue;  // 近水平，不像竖直灯条
 
-        // classifyColorRgb：框 ∩ 灰度前景 + 整帧 R>B/B>R → 1 红 / 2 蓝 / -1 丢掉。
-        light.color = classifyColorRgb(r_gt_b, b_gt_r, bin, light.pts);
+        // classifyColorRgb：框 ∩ 灰度前景 + ROI 上 R>B/B>R → 1 红 / 2 蓝 / -1 丢掉。
+        light.color = classifyColorRgb(frame, bin, light.pts);
         if (light.color != 1 && light.color != 2)
             continue;
 
         // hsvRatioInRotatedRect：旋转矩形 ∩ 该色 HSV → 占比，写入 Light::hsv_ratio（overlay 同源）。
-        const cv::Mat& color_hsv = (light.color == 1) ? red_hsv : blue_hsv;
-        light.hsv_ratio = hsvRatioInRotatedRect(color_hsv, light.pts);
+        const HsvParams& color_hsv_p = (light.color == 1) ? red_params_ : blue_params_;
+        light.hsv_ratio = hsvRatioInRotatedRect(frame, color_hsv_p, light.pts);
         // 红/蓝占比下限分开：读 params_（配置文件），关过滤时仍写入 hsv_ratio。
         if (params_.use_hsv_filter) {
             const double hsv_ratio_min =
