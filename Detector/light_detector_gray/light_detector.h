@@ -15,39 +15,88 @@
  * get_lights 每一步必须逐步注释（get_bin / R>B / findContours / 几何 / RGB / HSV 占比）。
  *
  * 装甲板灯条检测：BGR→灰度阈值分割 + 轮廓几何筛选 + 旋转矩形内 RGB 判色
- * + 对应色 HSV 在旋转矩形内的面积比门限（红/蓝下限分开）。过曝灯芯在灰度上仍是高亮，单阈值即可接住；
- * HSV 只做二次确认，不代替灰度找轮廓。
+ * + 可选的对应色 HSV 面积比门限（红/蓝下限分开，use_hsv_filter 关掉则不算过滤）。
+ * 红灯 H 为两段 OR：low 与 high（配置 red_h_*_low / red_h_*_high），因为 OpenCV H 在 0/180 环绕。
+ * 过曝灯芯在灰度上仍是高亮，单阈值即可接住；HSV 只做二次确认，不代替灰度找轮廓。
+ * hsv_ratio 始终写入 Light，筛选是否用它读 params_.use_hsv_filter；overlay 仍读同一字段。
+ * 几何/HSV 数值默认来自 config/detector_params.yaml；缺文件时用下面结构体初值（与新配置一致）。
  */
 
-/** 单色 HSV 上下限。OpenCV H∈[0,180]；红/蓝各一份，筛占比和 inRange 都读同一组。 */
+/**
+ * 单色 HSV 上下限。OpenCV H∈[0,180]。
+ * 红：h_min_low–h_max_low 或（若启用）h_min_high–h_max_high 任一命中，再乘 S/V。
+ * 蓝：只用 low 段（use_h_high=false）。筛占比和 inRange 都读同一组。
+ */
 struct HsvParams {
-    int h_min = 0, h_max = 180;
+    int h_min_low = 0;
+    int h_max_low = 180;
+    int h_min_high = 0;
+    int h_max_high = 0;
+    bool use_h_high = false;  // true：高段与低段 OR，用于红的 156–180
     int s_min = 0, s_max = 255;
     int v_min = 0, v_max = 255;
 };
 
 struct LightParams {
-    // 默认灰度阈值只在这里定一份。成员 gray_thres 不能当 LightParams::gray_thres 用
-    //（那是实例字段）；进度条初值请读 kGrayThresDefault。
+    // 缺配置文件时的灰度初值；有 yaml 时以 light.gray_thres 为准。进度条也读这份。
     static constexpr int kGrayThresDefault = 145;
     int gray_thres = kGrayThresDefault;  // 灰度下限，像素 > 该值视为前景；播放时可调
+    int close_ksize = 3;              // 闭运算核边长，须为奇数
     double min_height_width = 1.5;    // 细长比下限：Light::ratio = height/width
     double max_height_width = 15.0;   // 细长比上限，过瘦噪声丢掉
+    int min_area = 20;                // Light::area() 下限
+    int max_area = 3500;              // Light::area() 上限
+    double max_abs_angle = 25.0;      // |Light::angle| 上限（度）
+    // true：hsv_ratio 须大于红/蓝下限才保留；false：仍写入 hsv_ratio，但不按占比丢灯。
+    bool use_hsv_filter = true;
+    double hsv_ratio_min_red = 0.6;   // 红灯 hsv_ratio 须严格大于该值
+    double hsv_ratio_min_blue = 0.4;  // 蓝灯 hsv_ratio 须严格大于该值
 };
 
 class LightDetector {
 public:
     /**
-     * 作用：空检测器，灰度参数用 LightParams 默认值，并写入红/蓝 HSV 默认区间。
-     * 输入：无。输出：可直接 get_lights 的实例。
+     * 作用：空检测器，灰度/几何用 LightParams 默认值，红蓝 HSV 用新配置（红双段 H）。
+     * 输入：无。输出：可直接 get_lights；有 yaml 时再 loadConfig 覆盖。
      */
     LightDetector();
+
+    /**
+     * 作用：从 YAML 读 light + hsv 节点，覆盖 params_ 与红/蓝 HsvParams。
+     * 输入：path 为 detector_params.yaml 一类文件。输出：true 表示打开成功（缺键保持原值）。
+     */
+    bool loadConfig(const std::string& path);
+
+    /**
+     * 作用：整份写入灯条几何/灰度门槛（配置加载或测试用）。
+     * 输入：p 为完整 LightParams。输出：无。
+     */
+    void setParams(const LightParams& p) { params_ = p; }
+
+    /**
+     * 作用：写入红/蓝 HSV 区间（与 hsvMask / hsv_ratio 同源）。
+     * 输入：red/blue 为 HsvParams。输出：无。
+     */
+    void setHsvParams(const HsvParams& red, const HsvParams& blue);
 
     /**
      * 作用：把播放窗口 gray 进度条的值写进检测器。
      * 输入：thres 任意 int，内部夹到 [0,255]。输出：无；之后 get_bin 用新阈值。
      */
     void setGrayThres(int thres);
+
+    /**
+     * 作用：打开或关闭 HSV 面积比过滤（不改变 hsv_ratio 的计算方式）。
+     * 输入：on 为 true 时，红/蓝占比须大于 params_.hsv_ratio_min_red / hsv_ratio_min_blue。
+     * 输出：无；写入 params_.use_hsv_filter，get_lights 与进度条读同一份。
+     */
+    void setUseHsvFilter(bool on);
+
+    /**
+     * 作用：HSV 占比过滤当前是否启用。
+     * 输入：无。输出：与 params_.use_hsv_filter / 进度条 hsv_f 同一份。
+     */
+    bool useHsvFilter() const { return params_.use_hsv_filter; }
 
     /**
      * 作用：读出当前灰度阈值。
@@ -57,21 +106,33 @@ public:
 
     /**
      * 作用：只读查看全部检测参数。
-     * 输入：无。输出：LightParams 常引用，不要改它来调阈值（走 setGrayThres）。
+     * 输入：无。输出：LightParams 常引用，不要改它来调阈值（走 setGrayThres / setUseHsvFilter / loadConfig）。
      */
     const LightParams& params() const { return params_; }
 
     /**
-     * 作用：一帧里检出合法灯条（灰度分割 → 几何筛选 → RGB 判红/蓝 → HSV 面积比）。
+     * 作用：只读红灯 HSV 区间。
+     * 输入：无。输出：与 inRange / hsv_ratio 同一份 red_params_。
+     */
+    const HsvParams& redHsv() const { return red_params_; }
+
+    /**
+     * 作用：只读蓝灯 HSV 区间。
+     * 输入：无。输出：与 inRange / hsv_ratio 同一份 blue_params_。
+     */
+    const HsvParams& blueHsv() const { return blue_params_; }
+
+    /**
+     * 作用：一帧里检出合法灯条（灰度分割 → 几何筛选 → RGB 判红/蓝 → 可选 HSV 面积比）。
      * 输入：frame 必须是 BGR 三通道；bin_out 非空时写入与检测同一张已闭运算二值图。
-     * 输出：通过几何+RGB+HSV 占比门限的 Light 列表；空帧或非三通道返回空。
+     * 输出：通过几何+RGB（以及若 use_hsv_filter 则再过 HSV 占比）的 Light 列表；空帧或非三通道返回空。
      */
     std::vector<Light> get_lights(const cv::Mat& frame, cv::Mat* bin_out = nullptr);
 
     /**
      * 作用：得到灯条高亮前景，给找轮廓和调试窗用（必须同一张图）。
      * 输入：frame 为 BGR 三通道或单通道灰度。
-     * 输出：CV_8UC1，灰度 > gray_thres 为 255，再 3x3 椭圆闭运算补灯芯黑洞。
+     * 输出：CV_8UC1，灰度 > gray_thres 为 255，再 close_ksize 椭圆闭运算补灯芯黑洞。
      */
     cv::Mat get_bin(const cv::Mat& frame) const;
 
@@ -86,7 +147,7 @@ private:
                          const cv::Mat& bin, const cv::Point2f pts[4]) const;
 
     /**
-     * 作用：整帧 HSV 按一组 H/S/V 上下限做 inRange，得到该色前景。
+     * 作用：整帧 HSV 按 H/S/V 做 inRange。红可两段 H OR，蓝单段。
      * 输入：hsv 为 COLOR_BGR2HSV 结果；p 为红或蓝 HsvParams。
      * 输出：CV_8UC1，落在区间内为 255。
      */
@@ -101,6 +162,6 @@ private:
     double hsvRatioInRotatedRect(const cv::Mat& color_mask, const cv::Point2f pts[4]) const;
 
     LightParams params_;
-    HsvParams red_params_;   // 红灯 HSV：H 低段，筛占比与 inRange 同源
-    HsvParams blue_params_;  // 蓝灯 HSV：H≈80–105，筛占比与 inRange 同源
+    HsvParams red_params_;   // 红灯 HSV：H 低段或高段 OR，筛占比与 inRange 同源
+    HsvParams blue_params_;  // 蓝灯 HSV：单段 H，筛占比与 inRange 同源
 };

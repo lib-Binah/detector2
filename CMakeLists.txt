@@ -3,8 +3,9 @@
 # 每个函数须写清作用/输入/输出；调用处也要注明调谁、送什么、得到什么。
 #
 # detector2：灰度阈值灯条检测 + 装甲板配对（OpenCV + C++20）。
-# 可执行文件 light_test = 几何 Light + LightDetector + 双窗口播放调试。
+# 可执行文件 light_test = 几何 Light + LightDetector + 配置加载 + 双窗口播放调试。
 # 可执行文件 armor_test = 复用灯条检测（不改其源码）+ ArmorBoard + ArmorDetector + 数字 CNN + PnP。
+# detector_config.cpp：查找/打开 config/detector_params.yaml。改路径时三处目标都要加这一份。
 
 cmake_minimum_required(VERSION 3.10)
 project(detector2)
@@ -22,6 +23,7 @@ add_executable(light_test
         Detector/light_detector_gray/light_test.cpp
         Detector/light_detector_gray/Light.cpp
         Detector/light_detector_gray/light_detector.cpp
+        Detector/detector_config.cpp
 )
 
 # 头文件就地 #include "Light.h"；同时允许从工程根引用。
@@ -41,6 +43,7 @@ add_executable(armor_test
         Detector/armor_detector/number_classifier.cpp
         Detector/light_detector_gray/Light.cpp
         Detector/light_detector_gray/light_detector.cpp
+        Detector/detector_config.cpp
 )
 
 target_include_directories(armor_test PRIVATE

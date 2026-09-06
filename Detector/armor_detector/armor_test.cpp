@@ -9,10 +9,12 @@
  *
  * 四个窗口：
  *   displayimg          原图+灯条框+装甲板框及可选标注；顶栏 FPS/meanGray；只留 frame 进度条
+ *                       左上角贴 number_img（默认数字 ROI 的 Otsu 二值，与 CNN 输入同一张）
  *                       画面按 1920×1080 可用区域缩小（已扣标题栏和 1 条进度条）
  *   Frame with Armors   上半原图+框（无数字），下半灰度二值；上下拼接后约 2 倍帧高，
  *                       整体缩到不超过 1920×1080（已扣标题栏/底栏，与 displayimg 同一套上限）
- *   armor params        gray / color / conf：灰度阈值、配色、CNN 置信度门槛（从大窗拆出，避免挤占画面）
+ *   armor params        gray / hsv_f / color / conf：灰度阈值、HSV 占比过滤、配色、CNN 置信度
+ *                       （从大窗拆出，避免挤占画面）
  *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 板倾角 / 灯条倾角差 / 数字 / 置信度 / 距离
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
@@ -20,6 +22,7 @@
 #include <opencv2/opencv.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -29,6 +32,7 @@
 #include "Light.h"
 #include "armor_detector.h"
 #include "light_detector.h"
+#include "Detector/detector_config.h"
 
 using namespace cv;
 using namespace std;
@@ -53,6 +57,7 @@ constexpr int kTrackbarH = 46;         // GTK 一条进度条大约高度
 constexpr int kDisplayTrackbars = 1;   // displayimg 只留 frame；gray/color/conf 在 armor params
 
 int gray_thres = LightParams::kGrayThresDefault;
+int hsv_filter = 1;       // 1=按 Light::hsv_ratio 丢灯，0=关；与 LightParams::use_hsv_filter 同源
 int detect_color = 0;     // 0=红蓝都配，1=只红，2=只蓝；与 ArmorParams::detect_color 同源
 int conf_thres_pct = 80;  // CNN 置信度门槛 ×100（须大于该值）；写入 classifier_threshold，默认 80%
 
@@ -158,7 +163,7 @@ string findModelPath() {
 
 /**
  * 作用：对干净原图跑灯条+装甲板，并刷新 current_frame / current_gray。
- * 输入：raw 为 BGR；light_detector 用 gray_thres；armor_detector 用 detect_color/conf。
+ * 输入：raw 为 BGR；light_detector 用 gray_thres / hsv_filter；armor_detector 用 detect_color/conf。
  * 输出：bin=灯条二值；lights/armors 为检测结果。
  */
 void processArmors(const Mat& raw, LightDetector& light_detector, ArmorDetector& armor_detector,
@@ -166,6 +171,7 @@ void processArmors(const Mat& raw, LightDetector& light_detector, ArmorDetector&
     current_frame = raw.clone();
     cvtColor(current_frame, current_gray, COLOR_BGR2GRAY);
     light_detector.setGrayThres(gray_thres);  // 进度条 int → 灯条检测器 [0,255]
+    light_detector.setUseHsvFilter(hsv_filter != 0);  // hsv_f 0/1 → 是否用 hsv_ratio 丢灯
     lights = light_detector.get_lights(current_frame, &bin);  // BGR → 灯条 + 同源二值
 
     ArmorParams p = armor_detector.params();
@@ -244,8 +250,8 @@ void drawArmorOverlay(Mat& img, const std::vector<ArmorBoard>& armors) {
 }
 
 /**
- * 作用：把 20×28 数字 ROI 贴到画面左上，方便核对 CNN 输入是否同源。
- * 输入：img 为 BGR 画布；armors 带 number_img。输出：无。
+ * 作用：把 number_img（默认 Otsu 二值 20×28）贴到画面左上，核对与 CNN 输入是否同一张。
+ * 输入：img 为 BGR 画布；armors 带 number_img。输出：无。禁止另做一遍二值。
  */
 void drawNumberThumbnails(Mat& img, const std::vector<ArmorBoard>& armors) {
     int x = 8;
@@ -254,8 +260,8 @@ void drawNumberThumbnails(Mat& img, const std::vector<ArmorBoard>& armors) {
         if (armor.number_img.empty())
             continue;
         Mat vis;
-        cvtColor(armor.number_img, vis, COLOR_GRAY2BGR);
-        resize(vis, vis, Size(40, 56), 0, 0, INTER_NEAREST);
+        cvtColor(armor.number_img, vis, COLOR_GRAY2BGR);  // number_img 单通道 → BGR，不另做二值
+        resize(vis, vis, Size(40, 56), 0, 0, INTER_NEAREST);  // 最近邻放大，二值边缘保持 0/255
         if (x + vis.cols >= img.cols || y + vis.rows >= img.rows)
             break;
         vis.copyTo(img(Rect(x, y, vis.cols, vis.rows)));
@@ -277,7 +283,7 @@ Mat makeOverlayLegend() {
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "ang=center-line vs horizontal (deg)", Point(8, 88),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "dAng=|L.angle-R.angle|  drop if >6deg", Point(8, 110),
+    putText(panel, "dAng=|L.angle-R.angle|  drop if >max_dAng", Point(8, 110),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "num/conf=CNN 1-8  dist=PnP ||t|| meters", Point(8, 132),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
@@ -287,19 +293,21 @@ Mat makeOverlayLegend() {
 }
 
 /**
- * 作用：给 armor params 窗写 gray/color/conf 的含义（进度条名字太短）。
+ * 作用：给 armor params 窗写 gray/hsv_f/color/conf 的含义（进度条名字太短）。
  * 输入：无。输出：BGR 说明图，每帧 imshow，避免空窗被后端丢掉。
- * 原理：这三项从 displayimg 拆出，检测仍读同一全局变量，只是进度条换窗。
+ * 原理：这几项从 displayimg 拆出，检测仍读同一全局变量，只是进度条换窗。
  */
 Mat makeParamsLegend() {
-    Mat panel(110, 520, CV_8UC3, Scalar(28, 28, 28));
+    Mat panel(132, 520, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "gray=Light gray thres  (get_bin)", Point(8, 22),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "color 0=both 1=red 2=blue  (ArmorParams)", Point(8, 44),
+    putText(panel, "hsv_f 0=off 1=on  (HSV ratio gate, Light.hsv_ratio)", Point(8, 44),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "conf=CNN must >N%  (classifier_threshold)", Point(8, 66),
+    putText(panel, "color 0=both 1=red 2=blue  (ArmorParams)", Point(8, 66),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "same fields as matching / classify", Point(8, 88),
+    putText(panel, "conf=CNN must >N%  (classifier_threshold)", Point(8, 88),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
+    putText(panel, "same fields as matching / classify", Point(8, 110),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
     return panel;
 }
@@ -321,9 +329,9 @@ Mat makeDisplayCanvas(const Mat& vis, double fps, double mean_gray) {
 
 /**
  * 作用：打开视频，循环灯条+装甲板检测并显示。
- * 输入：stdin 读 0–4 选视频。输出：0 成功，非 0 打不开视频或找不到模型时仍可跑几何。
+ * 输入：可选 argv[1] 为 YAML；stdin 读 0–4 选视频。输出：0 成功，非 0 打不开视频或找不到模型时仍可跑几何。
  */
-int main() {
+int main(int argc, char** argv) {
     const string names[] = {
         "2025sj.avi",
         "hero_blue.avi",
@@ -389,6 +397,26 @@ int main() {
 
     LightDetector light_detector;
     ArmorDetector armor_detector;
+    const string cfg_preferred = (argc >= 2) ? argv[1] : string();
+    const string cfg_path = findDetectorConfigPath(cfg_preferred);
+    if (!cfg_path.empty()) {
+        const bool light_ok = light_detector.loadConfig(cfg_path);
+        const bool armor_ok = armor_detector.loadConfig(cfg_path);
+        const bool pnp_ok = ArmorBoard::loadPnpConfig(cfg_path);
+        if (light_ok && armor_ok && pnp_ok) {
+            cout << "config: " << cfg_path << "\n";
+            gray_thres = light_detector.grayThres();
+            hsv_filter = light_detector.useHsvFilter() ? 1 : 0;
+            detect_color = armor_detector.params().detect_color;
+            conf_thres_pct = std::clamp(
+                static_cast<int>(std::lround(armor_detector.params().classifier_threshold * 100.f)),
+                0, 100);
+        } else {
+            cout << "config incomplete: " << cfg_path << "\n";
+        }
+    } else {
+        cout << "config not loaded; using built-in defaults\n";
+    }
     const string model_path = findModelPath();
     if (model_path.empty() || !armor_detector.loadClassifier(model_path)) {
         cout << "CNN model not loaded; geometry+PnP still run, numbers skipped\n";
@@ -407,6 +435,7 @@ int main() {
     FrameScrubber scrubber;
     int shown_index = 0;
     int last_gray = -1;
+    int last_hsv_filter = -1;
     int last_color = -1;
     int last_conf = -1;
 
@@ -416,10 +445,11 @@ int main() {
     const string win_overlay = "armor overlay";
     namedWindow(win_display);  // 只留 frame，保持 AUTOSIZE，尺寸由缩放后的图画布决定
     namedWindow(win_combined, WINDOW_NORMAL);  // 组合大窗：允许 resizeWindow 钉在 1920×1080 内
-    namedWindow(win_params);  // gray/color/conf 从大窗拆到这里，避免 3 条进度条占画面高度
+    namedWindow(win_params);  // gray/hsv_f/color/conf 从大窗拆到这里，避免进度条占画面高度
     namedWindow(win_overlay);
     createTrackbar("frame", win_display, nullptr, trackbar_max, onFrameTrackbar, &scrubber);
     createTrackbar("gray", win_params, &gray_thres, 255);  // 灯条 get_bin 灰度门槛
+    createTrackbar("hsv_f", win_params, &hsv_filter, 1);  // 0=关 HSV 占比过滤，1=开
     createTrackbar("color", win_params, &detect_color, 2);  // 0 both / 1 red / 2 blue
     createTrackbar("conf", win_params, &conf_thres_pct, 100);  // CNN 须严格大于该百分比
     createTrackbar("type", win_overlay, &overlay_type, 1);
@@ -446,6 +476,7 @@ int main() {
         shown_index = idx;
         processArmors(raw, light_detector, armor_detector, bin, lights, armors);
         last_gray = gray_thres;
+        last_hsv_filter = hsv_filter;
         last_color = detect_color;
         last_conf = conf_thres_pct;
         syncTrackbar();
@@ -460,6 +491,7 @@ int main() {
         shown_index = std::clamp(pos - 1, 0, last_index);
         processArmors(raw, light_detector, armor_detector, bin, lights, armors);
         last_gray = gray_thres;
+        last_hsv_filter = hsv_filter;
         last_color = detect_color;
         last_conf = conf_thres_pct;
         syncTrackbar();
@@ -478,10 +510,11 @@ int main() {
                 updateFps(fps, is_show_fps);
         }
 
-        if (!raw.empty() && (gray_thres != last_gray || detect_color != last_color ||
-                             conf_thres_pct != last_conf)) {
+        if (!raw.empty() && (gray_thres != last_gray || hsv_filter != last_hsv_filter ||
+                             detect_color != last_color || conf_thres_pct != last_conf)) {
             processArmors(raw, light_detector, armor_detector, bin, lights, armors);
             last_gray = gray_thres;
+            last_hsv_filter = hsv_filter;
             last_color = detect_color;
             last_conf = conf_thres_pct;
         }
@@ -523,7 +556,7 @@ int main() {
         Mat shown_combined = scaleTo1080(combined, &combined_scale, 0);
         imshow(win_combined, shown_combined);
         resizeWindow(win_combined, shown_combined.cols, shown_combined.rows);  // 钉死缩放后尺寸，GTK AUTOSIZE 有时不随图缩小
-        imshow(win_params, makeParamsLegend());  // 无输入 → gray/color/conf 说明图
+        imshow(win_params, makeParamsLegend());  // 无输入 → gray/hsv_f/color/conf 说明图
         imshow(win_overlay, makeOverlayLegend());
 
         const int key = waitKeyEx(15);

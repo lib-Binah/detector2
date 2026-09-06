@@ -1,0 +1,128 @@
+%YAML:1.0
+---
+# detector_params_original.yaml
+# 改 HSV 双段红之前的门槛存档。键名与 detector_params.yaml 相同，可整份替换使用。
+# 用法：启动时传入本文件路径，例如
+#   ./armor_test /path/to/config/detector_params_original.yaml
+#   ros2 run armor_subscriber armor_subscriber --ros-args -p config_path:=.../detector_params_original.yaml
+# 红灯当时只有 H 低段 0–35，没有 156–180 环绕；S/V 也更紧（S≥120、V≥90）。
+
+# ---------- 灯条：灰度分割 + 几何（与改 HSV 前源码硬编码一致）----------
+light:
+  # 灰度二值下限：像素 > 该值视为灯条前景，再做闭运算。
+  gray_thres: 145
+  # 闭运算椭圆核边长（像素）。
+  close_ksize: 3
+  # 细长比下限：Light::ratio = height/width。
+  min_height_width: 1.5
+  # 细长比上限。
+  max_height_width: 15.0
+  # 旋转矩形面积下限（像素²）。
+  min_area: 20
+  # 旋转矩形面积上限。
+  max_area: 3500
+  # |Light::angle| 上限（度）。
+  max_abs_angle: 25.0
+  # 1=按 hsv_ratio 丢灯。
+  use_hsv_filter: 1
+  # 红灯 HSV 占比下限。
+  hsv_ratio_min_red: 0.6
+  # 蓝灯 HSV 占比下限。
+  hsv_ratio_min_blue: 0.4
+
+# ---------- HSV（旧：红无高段环绕，蓝 H 只到 105，S/V 更严）----------
+hsv:
+  # 红 H 低段下限。
+  red_h_min_low: 0
+  # 红 H 低段上限。旧实现只有这一段。
+  red_h_max_low: 35
+  # 红 H 高段下限。-1 表示关闭高段（不与 low 做 OR）。
+  red_h_min_high: -1
+  # 红 H 高段上限。关闭时无意义。
+  red_h_max_high: -1
+  # 红 S 下限。旧值 120，比现在更不容易把浅色算红。
+  red_s_min: 120
+  # 红 S 上限。
+  red_s_max: 255
+  # 红 V 下限。旧值 90。
+  red_v_min: 90
+  # 红 V 上限。
+  red_v_max: 255
+  # 蓝 H 下限。
+  blue_h_min: 80
+  # 蓝 H 上限。旧值 105，比现在的 120 更窄。
+  blue_h_max: 105
+  # 蓝 S 下限。旧值 20。
+  blue_s_min: 20
+  # 蓝 S 上限。
+  blue_s_max: 255
+  # 蓝 V 下限。旧值 200，比现在更要求亮。
+  blue_v_min: 200
+  # 蓝 V 上限。
+  blue_v_max: 255
+
+# ---------- 装甲板配对（改 HSV 前未改这些数）----------
+armor:
+  # 左右灯高之比（短/长）下限。
+  min_light_ratio: 0.7
+  # 小板归一化中心距下限。
+  min_small_center_distance: 0.8
+  # 小板归一化中心距上限。
+  max_small_center_distance: 3.2
+  # 大板归一化中心距下限 / SMALL·LARGE 分界。
+  min_large_center_distance: 3.2
+  # 大板归一化中心距上限。
+  max_large_center_distance: 5.5
+  # 板中心连线相对水平最大倾角（度）。
+  max_angle: 35.0
+  # 两灯 Light::angle 差上限（度）。
+  max_light_angle_diff: 10.0
+  # 0=红蓝都配。
+  detect_color: 0
+  # CNN 置信度须严格大于该值。
+  classifier_threshold: 0.80
+
+# ---------- 数字透视 ROI ----------
+number:
+  # 透视条带里灯条竖向像素。
+  light_length: 12
+  # 透视条带总高度。
+  warp_height: 28
+  # 小板条带宽。
+  small_armor_width: 32
+  # 大板条带宽。
+  large_armor_width: 54
+  # 原通路：透视后送灰度，不做 Otsu。
+  use_binary: 0
+
+# ---------- PnP 物点 mm ----------
+pnp:
+  # 小板宽。
+  small_width_mm: 135.0
+  # 小板高。
+  small_height_mm: 55.0
+  # 大板宽。
+  large_width_mm: 225.0
+  # 大板高。
+  large_height_mm: 55.0
+
+# ---------- 相机内参 ----------
+camera:
+  # 焦距 fx。
+  fx: 1777.4091341308808
+  # 焦距 fy。
+  fy: 1775.4170626354828
+  # 主点 cx。
+  cx: 710.75979428865026
+  # 主点 cy。
+  cy: 534.72407285624729
+  # 径向 k1。
+  k1: 0.0
+  # 径向 k2。
+  k2: 0.0
+  # 切向 p1。
+  p1: 0.0
+  # 切向 p2。
+  p2: 0.0
+  # 径向 k3。
+  k3: 0.0

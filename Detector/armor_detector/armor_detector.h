@@ -60,6 +60,12 @@ public:
     void setParams(const ArmorParams& p) { params_ = p; }
 
     /**
+     * 作用：从 YAML 读 armor 门槛，并让数字分类器读 number 透视尺寸与 use_binary。
+     * 输入：path 为 detector_params.yaml。输出：true 表示打开成功；缺键保持默认。
+     */
+    bool loadConfig(const std::string& path);
+
+    /**
      * 作用：加载数字 CNN。
      * 输入：model_path 为 ONNX。输出：true 表示加载成功。
      */

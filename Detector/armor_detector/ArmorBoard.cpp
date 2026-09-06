@@ -7,28 +7,25 @@
  * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角/灯条倾角差 → 画框 → IPPE PnP。
  */
 #include "ArmorBoard.h"
+#include "Detector/detector_config.h"
 
 #include <algorithm>
 #include <cmath>
 #include <vector>
 
-namespace {
-
 // 物点单位 mm。这是两灯条构成的矩形（不是外扩后的数字面）。
-// 改尺寸时 PnP 距离会一起变，overlay 读 dist_m 会跟着变。
-constexpr float kSmallArmorWidthMm = 135.f;
-constexpr float kSmallArmorHeightMm = 55.f;
-constexpr float kLargeArmorWidthMm = 225.f;
-constexpr float kLargeArmorHeightMm = 55.f;
+// 默认与旧硬编码一致；loadPnpConfig 从 yaml 覆盖。改尺寸时 PnP 距离会一起变。
+float ArmorBoard::small_width_mm_ = 135.f;
+float ArmorBoard::small_height_mm_ = 55.f;
+float ArmorBoard::large_width_mm_ = 225.f;
+float ArmorBoard::large_height_mm_ = 55.f;
 
-// 与 detector/ArmorBoard.cpp、clone_detector/tools/detect_video.py 同一份内参；畸变置零。
-const cv::Mat kCameraMatrix = (cv::Mat_<double>(3, 3) <<
+// 与 detector/ArmorBoard.cpp、clone_detector/tools/detect_video.py 同一份默认内参；畸变置零。
+cv::Mat ArmorBoard::camera_matrix_ = (cv::Mat_<double>(3, 3) <<
     1.7774091341308808e+03, 0.0, 7.1075979428865026e+02,
     0.0, 1.7754170626354828e+03, 5.3472407285624729e+02,
     0.0, 0.0, 1.0);
-const cv::Mat kDistCoeffs = (cv::Mat_<double>(5, 1) << 0, 0, 0, 0, 0);
-
-}  // namespace
+cv::Mat ArmorBoard::dist_coeffs_ = (cv::Mat_<double>(5, 1) << 0, 0, 0, 0, 0);
 
 /**
  * 作用：灯条上端点 = 左上与右上的中点。
@@ -122,8 +119,8 @@ bool ArmorBoard::solvePnP() {
     dist_m = -1.0;
 
     const bool large = (type == ArmorType::LARGE);
-    const float half_x = (large ? kLargeArmorWidthMm : kSmallArmorWidthMm) * 0.5f;
-    const float half_y = (large ? kLargeArmorHeightMm : kSmallArmorHeightMm) * 0.5f;
+    const float half_x = (large ? large_width_mm_ : small_width_mm_) * 0.5f;
+    const float half_y = (large ? large_height_mm_ : small_height_mm_) * 0.5f;
 
     // 物点：左下起顺时针。Y 正方向朝板下方，与 OpenCV 图像 y 向下一致。
     const std::vector<cv::Point3f> object_points = {
@@ -137,10 +134,10 @@ bool ArmorBoard::solvePnP() {
 
     cv::Mat r, t;
     // solvePnP IPPE：四共面点位姿；失败再试 ITERATIVE。
-    bool ok = cv::solvePnP(object_points, image_points, kCameraMatrix, kDistCoeffs,
+    bool ok = cv::solvePnP(object_points, image_points, camera_matrix_, dist_coeffs_,
                            r, t, false, cv::SOLVEPNP_IPPE);
     if (!ok)
-        ok = cv::solvePnP(object_points, image_points, kCameraMatrix, kDistCoeffs,
+        ok = cv::solvePnP(object_points, image_points, camera_matrix_, dist_coeffs_,
                           r, t, false, cv::SOLVEPNP_ITERATIVE);
     if (!ok)
         return false;
@@ -153,5 +150,44 @@ bool ArmorBoard::solvePnP() {
     tvec = t;
     dist_m = cv::norm(t) / 1000.0;  // mm → m
     pnp_ok = true;
+    return true;
+}
+
+/**
+ * 作用：YAML pnp/camera → 静态物点尺寸与内参。
+ * 输入：path。输出：true 表示打开成功。
+ */
+bool ArmorBoard::loadPnpConfig(const std::string& path) {
+    cv::FileStorage fs;
+    if (!openDetectorYaml(path, fs))
+        return false;
+
+    const cv::FileNode pnp = fs["pnp"];
+    readYaml(pnp, "small_width_mm", small_width_mm_);
+    readYaml(pnp, "small_height_mm", small_height_mm_);
+    readYaml(pnp, "large_width_mm", large_width_mm_);
+    readYaml(pnp, "large_height_mm", large_height_mm_);
+
+    const cv::FileNode cam = fs["camera"];
+    double fx = camera_matrix_.at<double>(0, 0);
+    double fy = camera_matrix_.at<double>(1, 1);
+    double cx = camera_matrix_.at<double>(0, 2);
+    double cy = camera_matrix_.at<double>(1, 2);
+    double k1 = dist_coeffs_.at<double>(0);
+    double k2 = dist_coeffs_.at<double>(1);
+    double p1 = dist_coeffs_.at<double>(2);
+    double p2 = dist_coeffs_.at<double>(3);
+    double k3 = dist_coeffs_.at<double>(4);
+    readYaml(cam, "fx", fx);
+    readYaml(cam, "fy", fy);
+    readYaml(cam, "cx", cx);
+    readYaml(cam, "cy", cy);
+    readYaml(cam, "k1", k1);
+    readYaml(cam, "k2", k2);
+    readYaml(cam, "p1", p1);
+    readYaml(cam, "p2", p2);
+    readYaml(cam, "k3", k3);
+    camera_matrix_ = (cv::Mat_<double>(3, 3) << fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0);
+    dist_coeffs_ = (cv::Mat_<double>(5, 1) << k1, k2, p1, p2, k3);
     return true;
 }

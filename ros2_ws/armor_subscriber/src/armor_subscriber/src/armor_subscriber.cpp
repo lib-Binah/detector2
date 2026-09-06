@@ -5,10 +5,13 @@
  * 不读 VideoCapture：出图节奏在 video_publisher；本节点只在回调里检测。
  * QoS KeepLast(1)：检测慢于出图时丢掉积压的旧帧，只处理最新一帧。
  * 检测与 overlay 读 Light / ArmorBoard 同一字段；waitKey(1) 只刷窗，不当节拍器。
+ * 左上角贴 number_img（默认数字 ROI 二值，与 CNN 输入同源）。
  * 每个函数须写清作用/输入/输出；调用处注明调谁、送什么、得到什么。
  */
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -22,6 +25,7 @@
 #include "Light.h"
 #include "armor_detector.h"
 #include "light_detector.h"
+#include "Detector/detector_config.h"
 
 namespace {
 
@@ -52,21 +56,56 @@ std::string findModelPath() {
     return {};
 }
 
+/**
+ * 作用：把 number_img（默认 Otsu 二值 20×28）贴到画面左上，与 CNN 输入同源。
+ * 输入：img 为 BGR 画布；armors 带 number_img。输出：无。禁止另做一遍二值。
+ */
+void drawNumberThumbnails(cv::Mat& img, const std::vector<ArmorBoard>& armors) {
+    int x = 8;
+    const int y = 8;
+    for (const auto& armor : armors) {
+        if (armor.number_img.empty())
+            continue;
+        cv::Mat vis;
+        cv::cvtColor(armor.number_img, vis, cv::COLOR_GRAY2BGR);  // 单通道 0/255 → BGR，方便贴到彩色画布
+        cv::resize(vis, vis, cv::Size(40, 56), 0, 0, cv::INTER_NEAREST);  // 最近邻放大，二值不糊边
+        if (x + vis.cols >= img.cols || y + vis.rows >= img.rows)
+            break;
+        vis.copyTo(img(cv::Rect(x, y, vis.cols, vis.rows)));
+        x += vis.cols + 4;
+    }
+}
+
 }  // namespace
 
 class ArmorSubscriber : public rclcpp::Node {
 public:
     /**
      * 作用：订 /image_raw、加载 CNN、可选打开调试窗。
-     * 输入：ROS 参数 topic / show_gui；gray/color/conf 与 armor_test 同源。
+ * 输入：ROS 参数 topic / show_gui / config_path；gray/hsv_filter/color/conf 可覆盖 YAML。
      * 输出：订阅建立后由 spin 驱动 onImage。
      */
     ArmorSubscriber() : Node("armor_subscriber") {
         const auto topic = declare_parameter<std::string>("topic", "/image_raw");
         show_gui_ = declare_parameter<bool>("show_gui", true);
-        gray_thres_ = static_cast<int>(declare_parameter<int>("gray_thres", LightParams::kGrayThresDefault));
-        detect_color_ = static_cast<int>(declare_parameter<int>("detect_color", 0));
-        conf_thres_pct_ = static_cast<int>(declare_parameter<int>("conf_thres_pct", 80));
+        const auto cfg_preferred = declare_parameter<std::string>("config_path", "");
+        const std::string cfg_path = findDetectorConfigPath(cfg_preferred);
+        if (!cfg_path.empty() && light_detector_.loadConfig(cfg_path) &&
+            armor_detector_.loadConfig(cfg_path) && ArmorBoard::loadPnpConfig(cfg_path)) {
+            RCLCPP_INFO(get_logger(), "config: %s", cfg_path.c_str());
+            gray_thres_ = light_detector_.grayThres();
+            hsv_filter_ = light_detector_.useHsvFilter() ? 1 : 0;
+            detect_color_ = armor_detector_.params().detect_color;
+            conf_thres_pct_ = std::clamp(
+                static_cast<int>(std::lround(armor_detector_.params().classifier_threshold * 100.f)),
+                0, 100);
+        } else {
+            RCLCPP_WARN(get_logger(), "config not loaded; using built-in defaults");
+        }
+        gray_thres_ = static_cast<int>(declare_parameter<int>("gray_thres", gray_thres_));
+        hsv_filter_ = static_cast<int>(declare_parameter<int>("hsv_filter", hsv_filter_));
+        detect_color_ = static_cast<int>(declare_parameter<int>("detect_color", detect_color_));
+        conf_thres_pct_ = static_cast<int>(declare_parameter<int>("conf_thres_pct", conf_thres_pct_));
 
         const std::string model_path = findModelPath();
         if (model_path.empty() || !armor_detector_.loadClassifier(model_path)) {
@@ -85,6 +124,7 @@ public:
         if (show_gui_) {
             cv::namedWindow(win_, cv::WINDOW_NORMAL);
             cv::createTrackbar("gray", win_, &gray_thres_, 255);   // 灯条 get_bin 灰度门槛
+            cv::createTrackbar("hsv_f", win_, &hsv_filter_, 1);    // 0=关 HSV 占比过滤，1=开
             cv::createTrackbar("color", win_, &detect_color_, 2);  // 0 both / 1 red / 2 blue
             cv::createTrackbar("conf", win_, &conf_thres_pct_, 100);  // CNN 须严格大于该百分比
         }
@@ -106,6 +146,7 @@ private:
     void processArmors(const cv::Mat& bgr, cv::Mat& bin, std::vector<Light>& lights,
                        std::vector<ArmorBoard>& armors) {
         light_detector_.setGrayThres(gray_thres_);  // 进度条 int → 灯条检测器 [0,255]
+        light_detector_.setUseHsvFilter(hsv_filter_ != 0);  // hsv_f 0/1 → 是否用 hsv_ratio 丢灯
         lights = light_detector_.get_lights(bgr, &bin);  // BGR → 灯条 + 同源二值
 
         ArmorParams p = armor_detector_.params();
@@ -170,9 +211,11 @@ private:
         for (auto& armor : armors)
             armor.draw_armor(vis);  // ArmorBoard 四顶点，与配对同一对象
         drawArmorText(vis, armors);
+        drawNumberThumbnails(vis, armors);  // 左上角贴 number_img（与 CNN 同一张二值/灰度）
 
+        // Hz 写在缩略图下方，避免盖住 40×56 的数字 ROI。
         cv::putText(vis, cv::format("Hz:%.1f L:%zu A:%zu", hz, lights.size(), armors.size()),
-                    cv::Point(8, 24), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 200, 100),
+                    cv::Point(8, 80), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 200, 100),
                     kFontThick, cv::LINE_AA);
         cv::imshow(win_, vis);
         const int key = cv::waitKey(1);  // 只刷 GUI，1ms，不决定检测节拍
@@ -186,6 +229,7 @@ private:
     std::chrono::steady_clock::time_point last_{std::chrono::steady_clock::now()};
     bool show_gui_ = true;
     int gray_thres_ = LightParams::kGrayThresDefault;
+    int hsv_filter_ = 1;  // 与 LightParams::use_hsv_filter 同源；进度条 / ROS 参数 hsv_filter
     int detect_color_ = 0;
     int conf_thres_pct_ = 80;
     const std::string win_{"armor recv"};
@@ -193,7 +237,7 @@ private:
 
 /**
  * 作用：起 ROS 上下文并 spin，帧来了才进 onImage。
- * 输入：argc/argv，可含 --ros-args -p topic:=/image_raw -p show_gui:=false。
+ * 输入：argc/argv，可含 --ros-args -p config_path:=.../detector_params_original.yaml -p hsv_filter:=0。
  * 输出：0 正常结束。
  */
 int main(int argc, char** argv) {

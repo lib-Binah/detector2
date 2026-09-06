@@ -21,7 +21,8 @@
  * 细长比 ratio：构造时写入 height/width，检测筛选和 overlay 都读这个字段。
  * 夹角：右上→右下边相对竖直的角度（度），atan2(Δx, Δy)，竖直时接近 0。
  * 面积：rotatedRect 的 OpenCV 宽×高，筛面积用 area()，不要在检测器里再乘一遍。
- * hsv_ratio：旋转矩形栅格内符合该色 HSV 的像素占比；筛灯条和 overlay 都读这个字段。
+ * hsv_ratio：旋转矩形栅格内符合该色 HSV 的像素占比；检测器始终写入，overlay 读同一字段。
+ * 是否用它丢灯条由 LightParams::use_hsv_filter 决定，改开关不改本字段公式。
  */
 class Light {
 public:
@@ -32,7 +33,7 @@ public:
     double angle = 0.0;           // 右上→右下相对竖直的夹角（度），近水平时接近 ±90
     double ratio = 0.0;           // height/width，构造时写入；宽过小则为 0
     int color = -1;               // 1=red, 2=blue, 其他=未知（由检测器 RGB 写入）
-    double hsv_ratio = 0.0;       // 框内该色 HSV 像素 / 旋转矩形栅格像素；检测与 overlay 同源
+    double hsv_ratio = 0.0;       // 框内该色 HSV 像素 / 旋转矩形栅格像素；过滤开关只决定是否丢灯
     cv::Point2f pts[4]{};         // [0]左上 [1]右上 [2]左下 [3]右下
 
     /**

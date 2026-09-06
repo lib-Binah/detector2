@@ -1,0 +1,128 @@
+%YAML:1.0
+---
+# detector_params.yaml
+# 当前使用的检测门槛。启动时默认读这一份。
+# 红灯 H 用两段：low(0–35) 或 high(156–180) 任一命中即可（OpenCV H∈[0,180] 在 0 处环绕）。
+# 恢复改 HSV 之前的门槛：改用 detector_params_original.yaml（命令行/ROS 传入路径）。
+
+# ---------- 灯条：灰度分割 + 几何 ----------
+light:
+  # 灰度二值下限：像素 > 该值视为灯条前景，再做闭运算。播放器 gray 进度条改的是同一项。
+  gray_thres: 145
+  # 闭运算椭圆核边长（像素）。只补灯芯小黑洞；太大易把两根灯粘在一起。须为奇数。
+  close_ksize: 3
+  # 细长比下限：Light::ratio = height/width。太胖的噪声丢掉。
+  min_height_width: 1.5
+  # 细长比上限。太瘦的线噪声丢掉。
+  max_height_width: 15.0
+  # 旋转矩形面积下限（像素²），滤碎点。筛面积必须读 Light::area()。
+  min_area: 20
+  # 旋转矩形面积上限，滤大块误分割。
+  max_area: 3500
+  # |Light::angle| 上限（度）。右上→右下相对竖直；近水平不当灯条。
+  max_abs_angle: 25.0
+  # 1=用 hsv_ratio 按红/蓝下限丢灯；0=仍计算 hsv_ratio（overlay 同源）但不按占比过滤。
+  use_hsv_filter: 1
+  # 红灯：旋转矩形内红色 HSV 像素占比必须严格大于该值才保留。
+  hsv_ratio_min_red: 0.6
+  # 蓝灯：蓝色 HSV 像素占比必须严格大于该值才保留。
+  hsv_ratio_min_blue: 0.4
+
+# ---------- HSV 二次确认（inRange，与 hsv_ratio 同源）----------
+# 红：H 落在 low 或 high 任一区间，且 S/V 在下面范围内，即算红色像素。
+hsv:
+  # 红 H 低段下限（过曝偏橙常落在这一段）。
+  red_h_min_low: 0
+  # 红 H 低段上限。
+  red_h_max_low: 35
+  # 红 H 高段下限（环绕 180 的深红）。<0 则关闭高段。
+  red_h_min_high: 156
+  # 红 H 高段上限。
+  red_h_max_high: 180
+  # 红 S 下限。过低会把灰白灯芯也算进红色。
+  red_s_min: 43
+  # 红 S 上限。
+  red_s_max: 255
+  # 红 V 下限。过低会把暗背景算进红色。
+  red_v_min: 110
+  # 红 V 上限。
+  red_v_max: 255
+  # 蓝 H 下限（单段，无环绕）。
+  blue_h_min: 80
+  # 蓝 H 上限。
+  blue_h_max: 120
+  # 蓝 S 下限。略低以兼容过曝发白的蓝灯。
+  blue_s_min: 30
+  # 蓝 S 上限。
+  blue_s_max: 255
+  # 蓝 V 下限。
+  blue_v_min: 150
+  # 蓝 V 上限。
+  blue_v_max: 255
+
+# ---------- 装甲板配对（读 ArmorBoard 已写入的字段）----------
+armor:
+  # 左右灯条 Light::height 之比（短/长）下限。过小说明不是同一块板。
+  min_light_ratio: 0.7
+  # 小板：两灯中心距 / 平均灯条高 的下限。
+  min_small_center_distance: 0.8
+  # 小板中心距上限；与大板下限相接。
+  max_small_center_distance: 3.2
+  # 大板中心距下限；同时也是 SMALL/LARGE 分界（须 > 该值才标 LARGE）。
+  min_large_center_distance: 3.2
+  # 大板中心距上限。
+  max_large_center_distance: 5.5
+  # 两灯中心连线相对水平的最大倾角（度）。
+  max_angle: 30.0
+  # |左 Light::angle - 右 Light::angle| 上限（度）。两灯倾角差太大不当一块板。
+  max_light_angle_diff: 10.0
+  # 0=红蓝都配（同色对），1=只红，2=只蓝。播放器 color 进度条改同一项。
+  detect_color: 0
+  # CNN softmax 最大类概率必须严格大于该值才留板。播放器 conf 进度条是它×100。
+  classifier_threshold: 0.75
+
+# ---------- 数字透视 ROI（须与训练 digit_cnn 裁图习惯一致）----------
+number:
+  # 透视条带里灯条竖向所占像素。改了必须同步训练裁图。
+  light_length: 12
+  # 透视条带总高度（像素）。CNN 输入高 28，条带高须 ≥ 28。
+  warp_height: 28
+  # 小板透视条带宽度，再从中间裁 20 列给 CNN。
+  small_armor_width: 32
+  # 大板透视条带宽度。
+  large_armor_width: 54
+  # 1：透视后对本块 ROI 做 Otsu 二值再写入 number_img（CNN 与左上角缩略图同源）。
+  # 0：送灰度。THRESH_BINARY 亮区=255。
+  use_binary: 1
+
+# ---------- PnP 物点（两灯条构成的矩形，单位 mm；改了 dist_m 会变）----------
+pnp:
+  # 小板宽度（左右灯中心距对应的物宽）。
+  small_width_mm: 135.0
+  # 小板高度（灯条长对应的物高）。
+  small_height_mm: 55.0
+  # 大板宽度。
+  large_width_mm: 225.0
+  # 大板高度。
+  large_height_mm: 55.0
+
+# ---------- 相机内参（像素）；畸变默认全 0 ----------
+camera:
+  # 焦距 fx（像素）。
+  fx: 1777.4091341308808
+  # 焦距 fy（像素）。
+  fy: 1775.4170626354828
+  # 主点 cx。
+  cx: 710.75979428865026
+  # 主点 cy。
+  cy: 534.72407285624729
+  # 径向畸变 k1。
+  k1: 0.0
+  # 径向畸变 k2。
+  k2: 0.0
+  # 切向畸变 p1。
+  p1: 0.0
+  # 切向畸变 p2。
+  p2: 0.0
+  # 径向畸变 k3。
+  k3: 0.0

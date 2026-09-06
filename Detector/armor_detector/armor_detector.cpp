@@ -14,10 +14,11 @@
  *   长度比 > min_light_ratio；
  *   归一化中心距落入小板或大板区间；
  *   中心连线倾角 < max_angle；
- *   |Light::angle 左 - Light::angle 右| 不大于 max_light_angle_diff（默认 6°）。
+ *   |Light::angle 左 - Light::angle 右| 不大于 max_light_angle_diff（配置默认 10°）。
  * 过关后透视数字、CNN 分类，最后 IPPE PnP。
  */
 #include "armor_detector.h"
+#include "Detector/detector_config.h"
 
 #include <algorithm>
 #include <cmath>
@@ -28,6 +29,28 @@
  */
 bool ArmorDetector::loadClassifier(const std::string& model_path) {
     return classifier_.loadModel(model_path);  // 路径 → NumberClassifier 内部 Net
+}
+
+/**
+ * 作用：YAML armor 节点 → 配对门槛，并加载 number 透视尺寸 / use_binary。
+ * 输入：path。输出：true 表示文件打开成功。
+ */
+bool ArmorDetector::loadConfig(const std::string& path) {
+    cv::FileStorage fs;
+    if (!openDetectorYaml(path, fs))
+        return false;
+    const cv::FileNode n = fs["armor"];
+    readYaml(n, "min_light_ratio", params_.min_light_ratio);
+    readYaml(n, "min_small_center_distance", params_.min_small_center_distance);
+    readYaml(n, "max_small_center_distance", params_.max_small_center_distance);
+    readYaml(n, "min_large_center_distance", params_.min_large_center_distance);
+    readYaml(n, "max_large_center_distance", params_.max_large_center_distance);
+    readYaml(n, "max_angle", params_.max_angle);
+    readYaml(n, "max_light_angle_diff", params_.max_light_angle_diff);
+    readYaml(n, "detect_color", params_.detect_color);
+    readYaml(n, "classifier_threshold", params_.classifier_threshold);
+    classifier_.loadConfig(path);  // number 透视条带尺寸 + use_binary（Otsu 是否写入 number_img）
+    return true;
 }
 
 /**
@@ -73,7 +96,7 @@ bool ArmorDetector::isArmor(ArmorBoard& armor) const {
     const bool distance_ok = small_ok || large_ok;
 
     const bool angle_ok = armor.angle < params_.max_angle;
-    // light_angle_diff 已在构造时用 Light::angle 算好；大于 6° 说明两灯条倾角差太大，不像一块板。
+    // light_angle_diff 已在构造时用 Light::angle 算好；大于 max_light_angle_diff 说明两灯条倾角差太大，不像一块板。
     const bool light_angle_ok = armor.light_angle_diff <= params_.max_light_angle_diff;
 
     // 分界用大板区间下限：比它大的当大板。overlay 的 type 必须读这个字段。
@@ -127,7 +150,7 @@ std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& ligh
     if (armors.empty())
         return armors;
 
-    // 2) extractNumbers：四端点透视 → 20×28 灰度，写入 number_img。
+    // 2) extractNumbers：四端点透视 → 20×28 → 可选 Otsu 二值，写入 number_img（与 CNN/左上角同源）。
     classifier_.extractNumbers(frame, armors);
 
     // 3) classify：CNN softmax；other / 置信度未大于门槛 / 大小板矛盾的板删掉。没模型则跳过。

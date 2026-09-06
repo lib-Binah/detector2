@@ -23,9 +23,9 @@
  * center_distance：两灯 Light::center() 距离 / 平均 Light::height（无量纲，远近近似不变）。
  * angle：两中心连线相对水平的倾角（度）。
  * light_angle_diff：|left.angle - right.angle|，读的就是灯条 Light::angle（右上→右下相对竖直）。
- * 绝对值大于 max_light_angle_diff（默认 6°）不当装甲板。筛选和 overlay 都读这个字段。
+ * 绝对值大于 max_light_angle_diff（配置默认 10°）不当装甲板。筛选和 overlay 都读这个字段。
  * 大小板：center_distance 落入小板或大板区间；分界读 min_large_center_distance。
- * PnP 物点：小板 135×55 mm、大板 225×55 mm（灯条矩形，不是整板外扩后的数字面）。
+ * PnP 物点：默认小板 135×55 mm、大板 225×55 mm，以配置 pnp 节为准（灯条矩形，不是数字面）。
  */
 enum class ArmorType { SMALL = 0, LARGE = 1 };
 
@@ -47,12 +47,12 @@ public:
     double light_ratio = 0.0;       // 短灯高 / 长灯高，读 Light::height
     double center_distance = 0.0;   // 中心距 / 平均 Light::height
     double angle = 0.0;             // 中心连线相对水平的倾角（度）
-    double light_angle_diff = 0.0;  // |Light::angle 左 - Light::angle 右|（度）；>6° 丢掉
+    double light_angle_diff = 0.0;  // |Light::angle 左 - Light::angle 右|（度）；大于配置 max_light_angle_diff 丢掉
 
     int number = 0;                 // 识别标签 1~8；0=未识别 / 拒识
     float confidence = 0.f;         // CNN softmax 最大类概率
     std::string classification_result;  // overlay 用，例如 "3:_92.0%"
-    cv::Mat number_img;             // 20×28 灰度，CNN 输入；overlay 可把这张图画出来
+    cv::Mat number_img;             // 20×28 单通道，默认 Otsu 二值，与 CNN 输入同源；overlay 左上角贴这张
 
     cv::Mat rvec;                   // PnP 旋转向量
     cv::Mat tvec;                   // PnP 平移，单位 mm（与物点一致）
@@ -98,10 +98,25 @@ public:
 
     /**
      * 作用：用四灯条端点做 IPPE PnP，得到相机系平移（mm）和距离（m）。
-     * 输入：无（读 type、四端点和写死的相机内参）。
+     * 输入：无（读 type、四端点和 loadPnpConfig 写入的内参/物点尺寸）。
      * 输出：true 表示解出且 tvec.z>0；写入 rvec/tvec/dist_m/pnp_ok。
      */
     bool solvePnP();
+
+    /**
+     * 作用：从 YAML 的 pnp / camera 节点写入物点尺寸和内参。
+     * 输入：path 为 detector_params.yaml。输出：true 表示文件打开成功；缺键保持默认。
+     */
+    static bool loadPnpConfig(const std::string& path);
+
+private:
+    // 物点 mm。默认与旧硬编码一致；loadPnpConfig 覆盖。改尺寸 dist_m 跟着变。
+    static float small_width_mm_;
+    static float small_height_mm_;
+    static float large_width_mm_;
+    static float large_height_mm_;
+    static cv::Mat camera_matrix_;
+    static cv::Mat dist_coeffs_;
 };
 
 #endif  // ARMOR_BOARD_H

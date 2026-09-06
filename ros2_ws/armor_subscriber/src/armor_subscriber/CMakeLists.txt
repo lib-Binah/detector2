@@ -28,6 +28,7 @@ add_executable(armor_subscriber
   ${DETECTOR2_ROOT}/Detector/armor_detector/number_classifier.cpp
   ${DETECTOR2_ROOT}/Detector/light_detector_gray/Light.cpp
   ${DETECTOR2_ROOT}/Detector/light_detector_gray/light_detector.cpp
+  ${DETECTOR2_ROOT}/Detector/detector_config.cpp
 )
 ament_target_dependencies(armor_subscriber
   rclcpp
@@ -37,6 +38,7 @@ ament_target_dependencies(armor_subscriber
 )
 target_include_directories(armor_subscriber PRIVATE
   ${OpenCV_INCLUDE_DIRS}
+  ${DETECTOR2_ROOT}
   ${DETECTOR2_ROOT}/Detector/light_detector_gray
   ${DETECTOR2_ROOT}/Detector/armor_detector
 )

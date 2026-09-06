@@ -10,7 +10,8 @@
  *
  * 三个窗口：
  *   displayimg          原图+旋转矩形及可选标注；画面外顶栏左=FPS/整帧灰度均值（带标签），
- *                       右=鼠标 HSV RGB Gray xy（带类型标签，字粗 1）；frame/gray 进度条
+ *                       右=鼠标 HSV RGB Gray xy（带类型标签，字粗 1）；frame/gray/hsv_f 进度条
+ *                       hsv_f 为 HSV 占比过滤（0=关，1=开），与 LightParams::use_hsv_filter 同源
  *   Frame with Lights   上半原图+框（无数字），下半灰度二值；整体缩到不超过 1920x1080
  *   light overlay       0/1 进度条：是否在 displayimg 上画灯条高/宽/细长比/倾角/颜色/HSV占比
  *                       以及框内 H/S/V 均值（三者同一开关 hsv_m）和灰度均值（开关 gray_m）
@@ -21,10 +22,12 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include "Light.h"
 #include "light_detector.h"
+#include "Detector/detector_config.h"
 
 using namespace cv;
 using namespace std;
@@ -52,6 +55,7 @@ constexpr int kMaxWinW = 1920;         // 窗口内容宽上限
 constexpr int kMaxWinH = 1080;         // 窗口内容高上限，含拼接后的组合窗
 // 进度条初值跟检测器默认同源；。
 int gray_thres = LightParams::kGrayThresDefault;
+int hsv_filter = 1;  // 1=按 hsv_ratio 丢灯，0=不算过滤；与 LightParams::use_hsv_filter 同源
 
 // light overlay 窗的 0/1 进度条：只改 displayimg 上的文字，不改检测。
 // 默认全开，和原先四行都画一致。GTK 进度条下限是 0，所以用 int 而不是 bool。
@@ -215,14 +219,15 @@ Mat scaleTo1080(const Mat& img, double* scale_out) {
 
 /**
  * 作用：对干净原图跑灯条检测，并刷新采样用的 current_frame / current_gray。
- * 输入：raw 为 BGR 帧；detector 会写入 gray_thres；bin/lights 为输出槽。
- * 输出：bin=与检测同一张二值图；lights=通过几何+RGB+HSV 占比的灯条。
+ * 输入：raw 为 BGR 帧；detector 写入 gray_thres 与 use_hsv_filter；bin/lights 为输出槽。
+ * 输出：bin=与检测同一张二值图；lights=通过几何+RGB（及可选 HSV 占比）的灯条。
  */
 void processLights(const Mat& raw, LightDetector& detector, Mat& bin,
                    std::vector<Light>& lights) {
     current_frame = raw.clone();
     cvtColor(current_frame, current_gray, COLOR_BGR2GRAY);  // BGR → 灰度，供顶栏 Gray/meanGray
     detector.setGrayThres(gray_thres);  // 进度条 int → 检测器 [0,255] 阈值
+    detector.setUseHsvFilter(hsv_filter != 0);  // hsv_f 0/1 → 是否用 hsv_ratio 丢灯
     // get_lights：BGR 帧 → lights；&bin 写出 get_bin 的二值图（阈值+闭运算）。
     lights = detector.get_lights(current_frame, &bin);
 }
@@ -399,9 +404,9 @@ Mat makeDisplayCanvas(const Mat& vis, double fps, double mean_gray) {
 
 /**
  * 作用：打开视频，循环检测并显示 displayimg / 组合窗 / overlay。
- * 输入：从 stdin 读 0–4 选视频。输出：进程退出码 0 成功，非 0 打不开视频。
+ * 输入：可选 argv[1] 为 YAML 路径；stdin 读 0–4 选视频。输出：0 成功，非 0 打不开视频。
  */
-int main() {
+int main(int argc, char** argv) {
     // 相对 cmake-build-debug 时 ../../Video 指向 TDT/Video；多前缀兼容其它工作目录。
     const string names[] = {
         "2025sj.avi",
@@ -409,6 +414,8 @@ int main() {
         "Infantry_blue.avi",
         "Infantry_red1.avi",
         "Infantry_red2.avi",
+        "2026_TDT_4.mp4",
+        "2026_10.mp4"
     };
     const string prefixes[] = {
         "../../Video/",
@@ -420,7 +427,7 @@ int main() {
     int i = 0;
     std::cout << "请输入0-4,按照Video目录顺序选取视频: ";
     cin >> i;
-    if (i < 0 || i > 4) {
+    if (i < 0 || i > names->size()) {
         cout << "Invalid index\n";
         return -1;
     }
@@ -470,11 +477,21 @@ int main() {
     Mat bin;
     std::vector<Light> lights;
     LightDetector detector;
+    const string cfg_preferred = (argc >= 2) ? argv[1] : string();
+    const string cfg_path = findDetectorConfigPath(cfg_preferred);
+    if (!cfg_path.empty() && detector.loadConfig(cfg_path)) {
+        cout << "config: " << cfg_path << "\n";
+        gray_thres = detector.grayThres();
+        hsv_filter = detector.useHsvFilter() ? 1 : 0;
+    } else {
+        cout << "config not loaded; using built-in HSV/geometry defaults\n";
+    }
     bool is_show_fps = true;
     double fps = 0.0;
     FrameScrubber scrubber;
     int shown_index = 0;
     int last_gray = -1;  // 暂停时拖 gray 也要重跑检测
+    int last_hsv_filter = -1;  // 暂停时拖 hsv_f 也要重跑检测
 
     const string win_display = "displayimg";
     const string win_combined = "Frame with Lights";
@@ -486,6 +503,7 @@ int main() {
     setMouseCallback(win_combined, onMouseCombined, nullptr);  // 组合窗 xy → toCombinedCoord → samplePixel
     createTrackbar("frame", win_display, nullptr, trackbar_max, onFrameTrackbar, &scrubber);  // 拖动 → seek 标志
     createTrackbar("gray", win_display, &gray_thres, 255);  // 直接改 gray_thres，无回调；主循环比对 last_gray
+    createTrackbar("hsv_f", win_display, &hsv_filter, 1);  // 0=关 HSV 占比过滤，1=开；与 use_hsv_filter 同源
     // overlay 全是 0/1：只控制 displayimg 文字，不触发重检。max 必须 >=1（GTK）。
     createTrackbar("H", win_overlay, &overlay_h, 1);
     createTrackbar("W", win_overlay, &overlay_w, 1);
@@ -511,6 +529,7 @@ int main() {
         shown_index = idx;
         processLights(raw, detector, bin, lights);  // raw(BGR) → lights + bin（get_bin 同源）
         last_gray = gray_thres;
+        last_hsv_filter = hsv_filter;
         syncTrackbar();
         return true;
     };
@@ -523,6 +542,7 @@ int main() {
         shown_index = std::clamp(pos - 1, 0, last_index);
         processLights(raw, detector, bin, lights);  // 下一帧 BGR → lights + bin
         last_gray = gray_thres;
+        last_hsv_filter = hsv_filter;
         syncTrackbar();
         return true;
     };
@@ -539,10 +559,11 @@ int main() {
                 updateFps(fps, is_show_fps);  // 新帧 Δt → fps；暂停不走这里
         }
 
-        // 暂停时改 gray 也立刻重检，否则二值窗看起来像没跟上。
-        if (!raw.empty() && gray_thres != last_gray) {
-            processLights(raw, detector, bin, lights);  // 同一帧、新 gray_thres → 重算 lights/bin
+        // 暂停时改 gray / hsv_f 也立刻重检，否则二值窗和灯条看起来像没跟上。
+        if (!raw.empty() && (gray_thres != last_gray || hsv_filter != last_hsv_filter)) {
+            processLights(raw, detector, bin, lights);  // 同一帧、新门槛 → 重算 lights/bin
             last_gray = gray_thres;
+            last_hsv_filter = hsv_filter;
         }
 
         if (raw.empty() || current_frame.empty() || bin.empty())
