@@ -129,7 +129,7 @@ void NumberClassifier::extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard
 }
 
 /**
- * 作用：CNN 分类；other / 置信度未严格大于门槛 / 大小板数字矛盾则删除该板。
+ * 作用：CNN 分类；other / 置信度未严格大于门槛 / 大板数字不是 1 或小板数字是 1 则删除该板。
  * 输入：已 extract 的 armors；threshold 为概率门槛（须 confidence > threshold，默认 0.80）。
  * 输出：就地留下通过的板。
  */
@@ -171,12 +171,9 @@ void NumberClassifier::classify(std::vector<ArmorBoard>& armors, float threshold
         ss << (armor.confidence * 100.f) << "%";
         armor.classification_result = ss.str();
 
-        // 大小板与兵种数字矛盾：大板不该是步兵 2~5，小板不该是英雄 1。
-        // 6/7/8 两边都留，模型没有 B/G/O 三类。
+        // 大小板与兵种数字：大板只认英雄 1（2~8 都丢掉）；小板不该是英雄 1。
         const bool large = (armor.type == ArmorType::LARGE);
-        const bool mismatch = large
-                                  ? (armor.number >= 2 && armor.number <= 5)
-                                  : (armor.number == 1);
+        const bool mismatch = large ? (armor.number != 1) : (armor.number == 1);
         if (mismatch)
             continue;
 

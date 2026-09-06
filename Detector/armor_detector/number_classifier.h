@@ -65,7 +65,7 @@ public:
     void extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard>& armors) const;
 
     /**
-     * 作用：对 number_img 做 CNN 前向；other / 置信度未严格大于门槛 / 大小板数字矛盾的板丢掉。
+     * 作用：对 number_img 做 CNN 前向；other / 置信度未严格大于门槛 / 大板非 1 或小板为 1 的板丢掉。
      * 输入：armors 须已 extractNumbers；threshold 为置信度门槛（须 confidence > threshold）。
      * 输出：就地删除未通过的板；通过的写入 number/confidence/classification_result。
      */

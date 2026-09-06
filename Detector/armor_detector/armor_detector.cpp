@@ -153,7 +153,7 @@ std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& ligh
     // 2) extractNumbers：四端点透视 → 20×28 → 可选 Otsu 二值，写入 number_img（与 CNN/左上角同源）。
     classifier_.extractNumbers(frame, armors);
 
-    // 3) classify：CNN softmax；other / 置信度未大于门槛 / 大小板矛盾的板删掉。没模型则跳过。
+    // 3) classify：CNN softmax；other / 置信度未大于门槛 / 大板非 1 或小板为 1 的板删掉。没模型则跳过。
     if (classifier_.loaded())
         classifier_.classify(armors, params_.classifier_threshold);
 

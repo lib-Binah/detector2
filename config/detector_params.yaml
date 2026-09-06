@@ -12,7 +12,7 @@ light:
   # 闭运算椭圆核边长（像素）。只补灯芯小黑洞；太大易把两根灯粘在一起。须为奇数。
   close_ksize: 3
   # 细长比下限：Light::ratio = height/width。太胖的噪声丢掉。
-  min_height_width: 1.5
+  min_height_width: 0.8
   # 细长比上限。太瘦的线噪声丢掉。
   max_height_width: 15.0
   # 旋转矩形面积下限（像素²），滤碎点。筛面积必须读 Light::area()。
@@ -79,7 +79,7 @@ armor:
   # 0=红蓝都配（同色对），1=只红，2=只蓝。播放器 color 进度条改同一项。
   detect_color: 0
   # CNN softmax 最大类概率必须严格大于该值才留板。播放器 conf 进度条是它×100。
-  classifier_threshold: 0.75
+  classifier_threshold: 0.9
 
 # ---------- 数字透视 ROI（须与训练 digit_cnn 裁图习惯一致）----------
 number:
