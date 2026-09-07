@@ -2,6 +2,7 @@
 #define NUMBER_CLASSIFIER_H
 
 #include <opencv2/opencv.hpp>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -16,7 +17,7 @@
  *
  * 数字分类器：透视把两灯条之间的数字区域拉成 20×28，可选 Otsu 二值，再跑 ONNX CNN。
  * 透视几何跟 clone_detector NumberClassifier::extractNumbers：灯条端点映到
- * 高 28、灯条长 12 的条带，再从中间裁 20×28。
+ * 高 28、灯条长 12 的条带；大板中间裁 20×28，小板中间裁宽 20×1.30=26 再在 preprocess 缩到 20。
  * number_img 必须与送进 preprocess 的是同一张图；左上角缩略图只读这个字段。
  */
 class NumberClassifier {
@@ -25,6 +26,16 @@ public:
     static constexpr int kDigit6Class = 5;    // softmax 索引 5 → 装甲数字 6
     static constexpr int kInputW = 20;        // 与训练 resize 宽一致
     static constexpr int kInputH = 28;        // 与训练 resize 高一致
+    // 小板数字 ROI 相对 CNN 宽 20 再加 30%（26 列），只加宽左右裁切；送模型前仍 resize 回 20。
+    static constexpr float kSmallRoiWidthScale = 1.30f;
+
+    /**
+     * 作用：小板数字 ROI 裁宽 = round(20×1.30)=26。
+     * 输入：无。输出：列数；extractNumbers 与条带宽下限都读它。
+     */
+    static int smallCropWidth() {
+        return std::max(1, cvRound(static_cast<float>(kInputW) * kSmallRoiWidthScale));
+    }
     // softmax 最大类概率必须严格大于该值才算装甲板（默认 80%）。播放器 conf 改的是这一项。
     static constexpr float kMinConfidence = 0.80f;
     // 数字 6 单独门槛（60%），不跟 conf 进度条；yaml armor.classifier_threshold_digit6 可覆盖。
@@ -62,9 +73,9 @@ public:
     bool loadConfig(const std::string& path);
 
     /**
-     * 作用：把每块板的数字区域透视成 20×28，可选 Otsu 二值，写入 ArmorBoard::number_img。
+     * 作用：把每块板的数字区域透视后裁中间列，可选 Otsu 二值，写入 ArmorBoard::number_img。
      * 输入：bgr 为当前帧（与灯条坐标同一分辨率）；armors 就地改。
-     * 输出：无返回值；失败的板 number_img 为空。use_binary_ 为 true 时 number_img 为 0/255。
+     * 输出：无返回值；失败的板 number_img 为空。小板裁宽为 20×1.30；大板仍 20。use_binary_ 为 true 时为 0/255。
      */
     void extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard>& armors) const;
 
@@ -85,7 +96,7 @@ public:
 private:
     /**
      * 作用：number_img → blob（二值或灰度都走同一套归一化）。
-     * 输入：单通道图，通常已是 20×28。输出：CV_32F blob [1,1,28,20]。
+     * 输入：单通道图。小板可能是 26×28，这里再缩到 20×28。输出：CV_32F blob [1,1,28,20]。
      */
     cv::Mat preprocess(const cv::Mat& gray) const;
 

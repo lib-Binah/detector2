@@ -16,10 +16,11 @@
  * 几何筛选必须读 ArmorBoard 的属性（light_ratio、center_distance、angle、light_angle_diff），与 overlay
  * 显示同源、计算方式相同；禁止在本文件里另写一套中心距或长度比。
  * 每个函数须写清作用、输入、输出；调用处也要注明调谁、送什么、得到什么。
- * get_armors 每一步必须逐步注释（同色配对 / containLight / isArmor / 数字 / PnP）。
+ * get_armors 每一步必须逐步注释（同色配对 / containLight / isArmor / 数字 / 贪心消共用灯 / PnP）。
  *
  * 装甲板检测：已检出的灯条 → 同色两两配对 → 包围盒不夹第三灯 → 几何像一块板
- * → CNN 认数字 → IPPE PnP。灯条本身仍由 LightDetector 提供，本类不改灯条源码。
+ * → CNN 认数字 → 贪心消共用灯（留置信度高的）→ IPPE PnP。
+ * 灯条本身仍由 LightDetector 提供，本类不改灯条源码。
  */
 struct ArmorParams {
     // 左右灯条 Light::height 之比（短/长）；过小说明两边不是同一块装甲。
@@ -75,9 +76,9 @@ public:
     bool classifierLoaded() const { return classifier_.loaded(); }
 
     /**
-     * 作用：一帧里从灯条配出装甲板：配对 → 数字 → PnP。
+     * 作用：一帧里从灯条配出装甲板：配对 → 数字 → 贪心消共用灯 → PnP。
      * 输入：lights 为 LightDetector::get_lights 的结果；frame 为同一帧 BGR。
-     * 输出：通过几何（以及若已加载模型则通过数字）的 ArmorBoard；PnP 失败仍保留几何板。
+     * 输出：通过几何（以及若已加载模型则通过数字）且灯条不共用的 ArmorBoard；PnP 失败仍保留几何板。
      */
     std::vector<ArmorBoard> get_armors(const std::vector<Light>& lights, const cv::Mat& frame);
 
@@ -99,6 +100,13 @@ private:
      * 输入：armor 构造时已算好四个量。输出：true 表示通过门槛。
      */
     bool isArmor(ArmorBoard& armor) const;
+
+    /**
+     * 作用：一根灯条只配一块板。按 ArmorBoard::confidence 从高到低贪心占灯（overlay 读同一字段）。
+     * 输入：armors 须已跑过 classify（没模型时 confidence 为 0，同分再比 light_ratio）。
+     * 输出：就地留下左右灯都未被占用的板；共用灯的低置信度板丢掉。
+     */
+    void greedyResolveSharedLights(std::vector<ArmorBoard>& armors) const;
 
     ArmorParams params_;
     NumberClassifier classifier_;

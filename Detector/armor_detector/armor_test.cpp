@@ -250,7 +250,7 @@ void drawArmorOverlay(Mat& img, const std::vector<ArmorBoard>& armors) {
 }
 
 /**
- * 作用：把 number_img（默认 Otsu 二值 20×28）贴到画面左上，核对与 CNN 输入是否同一张。
+ * 作用：把 number_img 贴到画面左上（大板 20×28，小板 26×28），核对与 CNN 输入是否同一张。
  * 输入：img 为 BGR 画布；armors 带 number_img。输出：无。禁止另做一遍二值。
  */
 void drawNumberThumbnails(Mat& img, const std::vector<ArmorBoard>& armors) {

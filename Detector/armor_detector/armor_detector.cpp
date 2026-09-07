@@ -15,7 +15,8 @@
  *   归一化中心距落入小板或大板区间；
  *   中心连线倾角 < max_angle；
  *   |Light::angle 左 - Light::angle 右| 不大于 max_light_angle_diff（配置默认 10°）。
- * 过关后透视数字、CNN 分类，最后 IPPE PnP。
+ * 过关后透视数字、CNN 分类。一根灯条最多属于一块板：按 confidence 从高到低贪心占灯，
+ * 共用灯条时留下模型置信度更高的那块。最后 IPPE PnP。
  */
 #include "armor_detector.h"
 #include "Detector/detector_config.h"
@@ -142,7 +143,47 @@ std::vector<ArmorBoard> ArmorDetector::matchLights(const std::vector<Light>& lig
 }
 
 /**
- * 作用：灯条 → 配对 → 数字 → PnP。
+ * 作用：按 confidence 从高到低贪心占用灯条，一根灯只留给一块板。
+ * 输入：已分类的 armors。输出：就地删掉与更高置信度板共用左或右灯的板。
+ */
+void ArmorDetector::greedyResolveSharedLights(std::vector<ArmorBoard>& armors) const {
+    if (armors.size() < 2)
+        return;
+
+    // 稳定排序：置信度高的先占灯；相同则 light_ratio 更大的更像一块板；再相同保持配对顺序。
+    std::stable_sort(armors.begin(), armors.end(),
+                     [](const ArmorBoard& a, const ArmorBoard& b) {
+                         if (a.confidence != b.confidence)
+                             return a.confidence > b.confidence;
+                         return a.light_ratio > b.light_ratio;
+                     });
+
+    auto sameCenter = [](const cv::Point2f& p, const cv::Point2f& q) { return p == q; };
+    std::vector<cv::Point2f> used_centers;
+    auto taken = [&](const cv::Point2f& c) {
+        for (const auto& u : used_centers) {
+            if (sameCenter(u, c))
+                return true;
+        }
+        return false;
+    };
+
+    std::vector<ArmorBoard> kept;
+    kept.reserve(armors.size());
+    for (auto& armor : armors) {
+        const cv::Point2f lc = armor.left.center();   // 与 containLight 同一套中心相等判定
+        const cv::Point2f rc = armor.right.center();
+        if (taken(lc) || taken(rc))
+            continue;
+        used_centers.push_back(lc);
+        used_centers.push_back(rc);
+        kept.push_back(std::move(armor));
+    }
+    armors.swap(kept);
+}
+
+/**
+ * 作用：灯条 → 配对 → 数字 → 贪心消共用灯 → PnP。
  * 输入：get_lights 的灯条 + 同一帧 BGR。输出：通过筛选的 ArmorBoard。
  */
 std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& lights,
@@ -153,14 +194,17 @@ std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& ligh
     if (armors.empty())
         return armors;
 
-    // 2) extractNumbers：四端点透视 → 20×28 → 可选 Otsu 二值，写入 number_img（与 CNN/左上角同源）。
+    // 2) extractNumbers：四端点透视 → 大板 20×28 / 小板宽 +30% → 可选 Otsu，写入 number_img。
     classifier_.extractNumbers(frame, armors);
 
     // 3) classify：CNN softmax；other / 置信度未大于门槛（数字 6 用固定 60%）/ 大板非 1 或小板为 1 的板删掉。没模型则跳过。
     if (classifier_.loaded())
         classifier_.classify(armors, params_.classifier_threshold);
 
-    // 4) solvePnP：每块板 IPPE；失败只把 pnp_ok=false，几何板仍留下给 overlay。
+    // 4) 贪心消共用灯：按 ArmorBoard::confidence 高→低占灯，一根灯条只留一块板。
+    greedyResolveSharedLights(armors);
+
+    // 5) solvePnP：每块板 IPPE；失败只把 pnp_ok=false，几何板仍留下给 overlay。
     for (auto& armor : armors)
         armor.solvePnP();
 

@@ -8,7 +8,7 @@
 # ---------- 灯条：灰度分割 + 几何 ----------
 light:
   # 灰度二值下限：像素 > 该值视为灯条前景，再做闭运算。播放器 gray 进度条改的是同一项。
-  gray_thres: 145
+  gray_thres: 120
   # 闭运算椭圆核边长（像素）。只补灯芯小黑洞；太大易把两根灯粘在一起。须为奇数。
   close_ksize: 3
   # 细长比下限：Light::ratio = height/width。太胖的噪声丢掉。
@@ -71,15 +71,15 @@ armor:
   # 大板中心距下限；同时也是 SMALL/LARGE 分界（须 > 该值才标 LARGE）。
   min_large_center_distance: 3.2
   # 大板中心距上限。
-  max_large_center_distance: 5.5
+  max_large_center_distance: 7
   # 两灯中心连线相对水平的最大倾角（度）。
   max_angle: 30.0
   # |左 Light::angle - 右 Light::angle| 上限（度）。两灯倾角差太大不当一块板。
-  max_light_angle_diff: 10.0
+  max_light_angle_diff: 15
   # 0=红蓝都配（同色对），1=只红，2=只蓝。播放器 color 进度条改同一项。
   detect_color: 0
   # CNN softmax 最大类概率必须严格大于该值才留板。播放器 conf 进度条是它×100。数字 6 不读这项。
-  classifier_threshold: 0.9
+  classifier_threshold: 0.75
   # 装甲数字 6（CNN 索引 5）单独门槛，须严格大于 0.60。不随 conf 进度条改写。
   classifier_threshold_digit6: 0.60
 
@@ -89,7 +89,7 @@ number:
   light_length: 12
   # 透视条带总高度（像素）。CNN 输入高 28，条带高须 ≥ 28。
   warp_height: 28
-  # 小板透视条带宽度，再从中间裁 20 列给 CNN。
+  # 小板透视条带宽度。中间裁宽 = 20×1.30=26 列（只加小板左右），再 resize 成 20 给 CNN。
   small_armor_width: 32
   # 大板透视条带宽度。
   large_armor_width: 54

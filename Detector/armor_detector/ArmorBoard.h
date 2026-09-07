@@ -52,7 +52,7 @@ public:
     int number = 0;                 // 识别标签 1~8；0=未识别 / 拒识
     float confidence = 0.f;         // CNN softmax 最大类概率
     std::string classification_result;  // overlay 用，例如 "3:_92.0%"
-    cv::Mat number_img;             // 20×28 单通道，默认 Otsu 二值，与 CNN 输入同源；overlay 左上角贴这张
+    cv::Mat number_img;             // 单通道数字 ROI：大板 20×28，小板 26×28（宽+30%），与 CNN 同源；overlay 左上角贴这张
 
     cv::Mat rvec;                   // PnP 旋转向量
     cv::Mat tvec;                   // PnP 平移，单位 mm（与物点一致）

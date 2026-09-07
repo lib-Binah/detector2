@@ -2,7 +2,7 @@
  * 注释契约：禁止随意删除本文件注释；改 warp 尺寸、归一化、类别映射、数字 6 门槛或大小板矛盾规则时必须改注释。
  * 每个函数须写清作用/输入/输出；OpenCV DNN / 透视调用处也要注明。
  *
- * 数字：灯条端点透视 → 20×28 → 可选 Otsu 二值 → (x/255-0.5)/0.5 → ONNX Softmax → 1~8 / other。
+ * 数字：灯条端点透视 → 大板裁 20×28 / 小板裁宽 +30% 再缩回 20 → 可选 Otsu → 归一化 → ONNX。
  * 置信度：除数字 6 外须 > conf 门槛；数字 6（索引 5）须 > digit6_threshold_（默认 0.60），不跟 conf。
  * number_img 与 CNN 输入必须是同一张；改二值开关时 overlay 左上角跟着变。
  */
@@ -48,7 +48,7 @@ void NumberClassifier::setDigit6Threshold(float t) {
 void NumberClassifier::setWarpParams(int light_length, int warp_height, int small_w, int large_w) {
     light_length_ = std::max(1, light_length);
     warp_height_ = std::max(kInputH, warp_height);
-    small_armor_width_ = std::max(kInputW, small_w);
+    small_armor_width_ = std::max(smallCropWidth(), small_w);
     large_armor_width_ = std::max(kInputW, large_w);
 }
 
@@ -78,11 +78,11 @@ bool NumberClassifier::loadConfig(const std::string& path) {
 
 /**
  * 作用：number_img → blob。二值 0/255 与灰度都走 (x/255-0.5)/0.5。
- * 输入：单通道图（通常已是 20×28）。输出：[1,1,28,20] float。
+ * 输入：单通道图（小板可能是 26×28）。输出：[1,1,28,20] float。
  */
 cv::Mat NumberClassifier::preprocess(const cv::Mat& gray) const {
     cv::Mat src;
-    // 已是 20×28 则不再 resize（extractNumbers 写出的 number_img 正是这个尺寸）。
+    // 已是 20×28 则不再 resize；小板 26×28 会走进下面的 INTER_NEAREST。
     if (gray.cols == kInputW && gray.rows == kInputH)
         src = gray;
     else
@@ -96,7 +96,7 @@ cv::Mat NumberClassifier::preprocess(const cv::Mat& gray) const {
 }
 
 /**
- * 作用：每块板透视出 20×28 数字图，可选 Otsu 二值，写入 number_img（CNN 与左上角缩略图同源）。
+ * 作用：每块板透视出数字图：大板中间 20×28，小板中间宽 20×1.30=26（高仍 28），可选 Otsu，写入 number_img。
  * 输入：BGR 帧；armors 就地改。输出：无。use_binary_ 为 true 时 number_img 为 0/255。
  */
 void NumberClassifier::extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard>& armors) const {
@@ -123,10 +123,12 @@ void NumberClassifier::extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard
         cv::Mat warped;
         cv::warpPerspective(bgr, warped, M, cv::Size(warp_width, warp_height_));
 
-        const int x0 = (warp_width - kInputW) / 2;
-        if (x0 < 0 || warped.cols < x0 + kInputW || warped.rows < kInputH)
+        // 大板仍裁 20 列；小板裁宽 +30%（26 列），只加宽左右，上下仍用 kInputH。
+        const int crop_w = (armor.type == ArmorType::SMALL) ? smallCropWidth() : kInputW;
+        const int x0 = (warp_width - crop_w) / 2;
+        if (x0 < 0 || warped.cols < x0 + crop_w || warped.rows < kInputH)
             continue;
-        const cv::Mat roi = warped(cv::Rect(x0, 0, kInputW, kInputH));  // 中间 20×28
+        const cv::Mat roi = warped(cv::Rect(x0, 0, crop_w, kInputH));
 
         cv::Mat gray;
         if (roi.channels() == 3)
