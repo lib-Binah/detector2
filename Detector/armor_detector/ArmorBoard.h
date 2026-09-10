@@ -27,9 +27,10 @@
  * 大小板：center_distance 落入小板或大板区间；分界读 min_large_center_distance。
  * PnP 物点：默认小板 135×55 mm、大板 225×55 mm，以配置 pnp 节为准（灯条矩形，不是数字面）。
  * 物系：板在 z=0，X 右、Y 下（与图像一致），+Z = X×Y，板正面朝向相机时 +Z 指向相机。
- * IPPE 有两个根：选 t.z>0 且板正面朝向相机（相机系 n_z<0）的那一个，重投影更小优先。
- * normal_cam：板法线在相机系的单位向量，强制取远离相机的一侧（n_z≥0），给 overlay / 后续车心用。
- * 检测画法线必须读 normal_cam，禁止显示时另从 rvec 推一遍。
+ * IPPE 两根俯仰接近相反，重投影几乎一样，只比误差会让法线上下跳。
+ * 选根：板在前方、正面朝向相机，且远离相机的法线略朝下（OpenCV 相机 y>0）。
+ * 原理：兵种装甲上沿更近、板面朝斜上，背离相机的法线应指向车内略朝下。
+ * normal_cam：相机系单位法线，远离相机（n_z≥0）且默认 n_y≥0；overlay 必须读它，禁止另从 rvec 推。
  */
 enum class ArmorType { SMALL = 0, LARGE = 1 };
 
@@ -60,7 +61,7 @@ public:
 
     cv::Mat rvec;                   // PnP 旋转向量（选中的 IPPE 根）
     cv::Mat tvec;                   // PnP 平移，单位 mm（与物点一致）
-    cv::Vec3d normal_cam{0, 0, 0};  // 相机系单位法线，指向远离相机（n_z≥0）；与 draw_normal 同源
+    cv::Vec3d normal_cam{0, 0, 0};  // 相机系单位法线：远离相机（n_z≥0），默认略朝下（n_y≥0）
     double dist_m = -1.0;           // ||tvec||/1000；<=0 表示未解或失败
     double reproj_error_px = -1.0;  // 四点平均重投影误差（像素）；<0 表示未解
     bool pnp_ok = false;
@@ -104,14 +105,15 @@ public:
 
     /**
      * 作用：把板法线画成箭头，方向是远离相机（读 normal_cam，与 solvePnP 同一向量）。
-     * 原理：相机系 tvec 为起点，沿 normal_cam 走 4 倍板高（约一块板宽），用与 PnP 相同的 K/D 投到像素。
+     * 原理：相机系 tvec 为起点，沿 normal_cam 走约 5 倍板高（远距离再按深度加长），
+     * 用与 PnP 相同的 K/D 投到像素。方向是远离相机、默认略朝下。
      * 输入：img 为要画的 BGR 图（就地修改）。pnp_ok 为 false 时不画。
      * 输出：无返回值。
      */
     void draw_normal(cv::Mat& img) const;
 
     /**
-     * 作用：四共面点 IPPE 双根 PnP，选出板在相机前方、正面朝向我们的根，并写法线。
+     * 作用：四共面点 IPPE 双根 PnP；用「正面朝向我们 + 背法线略朝下」消俯仰歧义。
      * 输入：无（读 type、四端点和 loadPnpConfig 写入的内参/物点尺寸）。
      * 输出：true 表示解出且 tvec.z>0；写入 rvec/tvec/normal_cam/dist_m/reproj_error_px/pnp_ok。
      */

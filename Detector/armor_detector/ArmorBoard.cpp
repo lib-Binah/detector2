@@ -56,6 +56,21 @@ cv::Vec3d objectZInCamera(const cv::Mat& rvec) {
     return cv::Vec3d(R.at<double>(0, 2), R.at<double>(1, 2), R.at<double>(2, 2));
 }
 
+/**
+ * 作用：物系 +Z 翻成「远离相机」的单位法线（n_z≥0）。
+ * 输入：rvec。输出：相机系单位向量；退化时为零向量。
+ * 原理：正面朝向我们时 +Z 指向相机，取反后指向车内；OpenCV y 向下，n_y>0 即略朝下。
+ */
+cv::Vec3d awayNormalCam(const cv::Mat& rvec) {
+    cv::Vec3d n = objectZInCamera(rvec);
+    if (n[2] < 0.0)
+        n = -n;
+    const double len = cv::norm(n);
+    if (len < 1e-9)
+        return cv::Vec3d(0, 0, 0);
+    return n / len;
+}
+
 }  // namespace
 
 // 物点单位 mm。这是两灯条构成的矩形（不是外扩后的数字面）。
@@ -167,9 +182,9 @@ void ArmorBoard::draw_normal(cv::Mat& img) const {
     tvec.convertTo(t64, CV_64F);
     t64 = t64.reshape(1, 3);
     const cv::Point3d origin(t64.at<double>(0, 0), t64.at<double>(1, 0), t64.at<double>(2, 0));
-    // 箭头长度 = 4 倍板高（约一块小板宽），比灯条高更易看出朝向；改倍率时同步改头文件注释。
-    const double height_mm = (type == ArmorType::LARGE) ? large_height_mm_ : small_height_mm_;
-    const double len = 4.0 * height_mm;
+    // 箭头加长：5 倍板高，远距离再用深度的 18%，否则俯仰几乎看不出来。
+    const double plate_h = (type == ArmorType::LARGE) ? large_height_mm_ : small_height_mm_;
+    const double len = std::max(5.0 * plate_h, 0.18 * origin.z);
     const cv::Point3d tip(origin.x + normal_cam[0] * len,
                           origin.y + normal_cam[1] * len,
                           origin.z + normal_cam[2] * len);
@@ -198,7 +213,7 @@ void ArmorBoard::draw_normal(cv::Mat& img) const {
 }
 
 /**
- * 作用：四共面点 IPPE 双根 PnP；选出板在前方且正面朝向相机的根；法线改存远离相机一侧。
+ * 作用：四共面点 IPPE 双根 PnP；正面朝向相机，背法线锁定略朝下，避免俯仰跳变。
  * 输入：无（读 type 与四端点）。输出：成功且深度合法为 true。
  */
 bool ArmorBoard::solvePnP() {
@@ -248,6 +263,7 @@ bool ArmorBoard::solvePnP() {
     const size_t nroots = std::min(rvecs.size(), tvecs.size());
     int best = -1;
     bool best_faces_cam = false;
+    bool best_points_down = false;
     double best_err = std::numeric_limits<double>::infinity();
 
     for (size_t i = 0; i < nroots; ++i) {
@@ -264,18 +280,25 @@ bool ArmorBoard::solvePnP() {
         if (err > kMaxReprojPx)
             continue;
 
-        // 物系 +Z 的相机 z 分量：<0 表示板正面朝向我们（法线指向相机）。
-        const cv::Vec3d n = objectZInCamera(r64);
-        const bool faces_cam = n[2] < 0.0;
+        // 物系 +Z 的相机 z 分量：<0 表示板正面朝向我们（看得见灯条的那一面）。
+        const cv::Vec3d n_obj = objectZInCamera(r64);
+        const bool faces_cam = n_obj[2] < 0.0;
+        const cv::Vec3d away = awayNormalCam(r64);
+        // OpenCV 相机 y 向下：远离相机的法线 n_y>0 即图像里略朝下。
+        const bool points_down = away[1] > 0.0;
 
-        // 先保正面朝向我们的根（看得见灯条的那一面），同组里再取重投影更小的。
+        // 两根俯仰接近相反，重投影差往往小于角点抖动，只比误差会上下跳。
+        // 朝下先验优先于更小重投影：兵种板上沿更近，背法线应指向车内略朝下。
         const bool better = (best < 0) ||
                             (faces_cam && !best_faces_cam) ||
-                            (faces_cam == best_faces_cam && err < best_err);
+                            (faces_cam == best_faces_cam && points_down && !best_points_down) ||
+                            (faces_cam == best_faces_cam && points_down == best_points_down &&
+                             err < best_err);
         if (!better)
             continue;
         best = static_cast<int>(i);
         best_faces_cam = faces_cam;
+        best_points_down = points_down;
         best_err = err;
         rvec = r64;
         tvec = t64;
@@ -284,14 +307,10 @@ bool ArmorBoard::solvePnP() {
     if (best < 0)
         return false;
 
-    cv::Vec3d n = objectZInCamera(rvec);
-    // 显示和后续车心要用「远离相机」：若 +Z 指向相机就取反，保证 n_z≥0。
-    if (n[2] < 0.0)
-        n = -n;
-    const double nlen = cv::norm(n);
-    if (nlen < 1e-9)
+    const cv::Vec3d n = awayNormalCam(rvec);
+    if (cv::norm(n) < 1e-9)
         return false;
-    normal_cam = n / nlen;
+    normal_cam = n;
 
     dist_m = cv::norm(tvec) / 1000.0;  // mm → m
     reproj_error_px = best_err;

@@ -3,20 +3,20 @@
  * @brief 灯条 + 装甲板配对 / 数字 CNN / PnP 的播放调试（不改灯条检测源码）
  *
  * 注释契约：禁止随意删除本文件注释；改窗口布局、HUD、进度条或快捷键时必须改注释。
- * overlay 画的 type/lr/cd/ang/dAng/num/conf/dist/nml 必须读 ArmorBoard 的同一属性，与配对/分类/PnP
+ * overlay 画的 type/lr/cd/ang/dAng/num/dist/nml 必须读 ArmorBoard 的同一属性，与配对/分类/PnP
  * 计算方式相同；禁止显示时另算中心距、长度比或从 rvec 另推法线。灯条框仍读 Light 字段。
  * 每个函数须写清作用、输入、输出；调用处也要注明。
  *
  * 四个窗口：
  *   displayimg          原图+灯条框+装甲板框及可选标注；顶栏 FPS/meanGray；只留 frame 进度条
  *                       左上角贴 number_img（默认数字 ROI 的 Otsu 二值，与 CNN 输入同一张）
- *                       nml 开时画品红箭头：PnP 法线，方向远离相机（读 ArmorBoard::normal_cam）
+ *                       nml 开时画品红箭头：远离相机的法线，默认略朝下（读 ArmorBoard::normal_cam）
  *                       画面按 1920×1080 可用区域缩小（已扣标题栏和 1 条进度条）
  *   Frame with Armors   上半原图+框（无数字），下半灰度二值；上下拼接后约 2 倍帧高，
  *                       整体缩到不超过 1920×1080（已扣标题栏/底栏，与 displayimg 同一套上限）
  *   armor params        gray / hsv_f / color / conf：灰度阈值、HSV 占比过滤、配色、CNN 置信度
  *                       （conf 不含数字 6，数字 6 固定 60%；从大窗拆出，避免挤占画面）
- *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 板倾角 / 灯条倾角差 / 数字 / 置信度 / 距离 / 法线
+ *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 板倾角 / 灯条倾角差 / 数字 / 距离 / 法线
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
  */
@@ -68,8 +68,7 @@ int overlay_lr = 1;     // ArmorBoard::light_ratio，与 isArmor 同一字段
 int overlay_cd = 1;     // ArmorBoard::center_distance
 int overlay_ang = 1;    // ArmorBoard::angle（两中心连线相对水平）
 int overlay_dAng = 1;   // ArmorBoard::light_angle_diff，与配对同一字段
-int overlay_num = 1;    // number + classification_result
-int overlay_conf = 1;   // ArmorBoard::confidence
+int overlay_num = 1;    // classification_result（已含数字和概率，不再另画 p）
 int overlay_dist = 1;   // ArmorBoard::dist_m（PnP）
 int overlay_nml = 1;    // ArmorBoard::draw_normal，读 normal_cam（远离相机）
 
@@ -185,7 +184,7 @@ void processArmors(const Mat& raw, LightDetector& light_detector, ArmorDetector&
 }
 
 /**
- * 作用：按 overlay 开关在装甲板旁画 type/lr/cd/ang/dAng/num/conf/dist，并可选画远离相机的法线。
+ * 作用：按 overlay 开关在装甲板旁画 type/lr/cd/ang/dAng/num/dist，并可选画远离相机的法线。
  * 输入：img 为已画框的 BGR；armors 为 get_armors 的结果。
  * 输出：无返回值。数字必须读 ArmorBoard 字段，禁止另算中心距、长度比、灯条倾角差或法线。
  */
@@ -200,7 +199,7 @@ void drawArmorOverlay(Mat& img, const std::vector<ArmorBoard>& armors) {
         const int nlines = (overlay_type ? 1 : 0) + (overlay_lr ? 1 : 0) +
                            (overlay_cd ? 1 : 0) + (overlay_ang ? 1 : 0) +
                            (overlay_dAng ? 1 : 0) +
-                           (overlay_num ? 1 : 0) + (overlay_conf ? 1 : 0) +
+                           (overlay_num ? 1 : 0) +
                            (overlay_dist ? 1 : 0);
         if (nlines == 0)
             continue;
@@ -238,15 +237,11 @@ void drawArmorOverlay(Mat& img, const std::vector<ArmorBoard>& armors) {
             y += line_h;
         }
         if (overlay_num) {
+            // classification_result 已是 "3:_92.0%"，与 confidence 同源，不再另画 p。
             const string num = armor.classification_result.empty()
                                    ? (armor.number > 0 ? std::to_string(armor.number) : "?")
                                    : armor.classification_result;
             putText(img, num, Point(org.x, y), FONT_HERSHEY_PLAIN, 0.95, text, kFontThick, LINE_AA);
-            y += line_h;
-        }
-        if (overlay_conf) {
-            putText(img, cv::format("p:%.2f", armor.confidence), Point(org.x, y),
-                    FONT_HERSHEY_PLAIN, 0.95, text, kFontThick, LINE_AA);
             y += line_h;
         }
         if (overlay_dist) {
@@ -292,9 +287,9 @@ Mat makeOverlayLegend() {
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "dAng=|L.angle-R.angle|  drop if >max_dAng", Point(8, 110),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "num/conf=CNN 1-8  dist=PnP ||t|| meters", Point(8, 132),
+    putText(panel, "num=CNN 1-8 with %  dist=PnP ||t|| meters", Point(8, 132),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
-    putText(panel, "nml=magenta arrow  plate normal away from cam", Point(8, 154),
+    putText(panel, "nml=magenta  away-from-cam normal (slightly down)", Point(8, 154),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(255, 0, 255), kFontThick, LINE_AA);
     putText(panel, "H/angle=Light fields  same as matching", Point(8, 176),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
@@ -469,7 +464,6 @@ int main(int argc, char** argv) {
     createTrackbar("ang", win_overlay, &overlay_ang, 1);
     createTrackbar("dAng", win_overlay, &overlay_dAng, 1);
     createTrackbar("num", win_overlay, &overlay_num, 1);
-    createTrackbar("conf", win_overlay, &overlay_conf, 1);
     createTrackbar("dist", win_overlay, &overlay_dist, 1);
     createTrackbar("nml", win_overlay, &overlay_nml, 1);  // 0/1：品红法线箭头，读 normal_cam
 
