@@ -1,17 +1,62 @@
 /**
- * 注释契约：禁止随意删除本文件注释；改端点公式、物点尺寸、内参或绘制颜色时必须改注释。
+ * 注释契约：禁止随意删除本文件注释；改端点公式、物点尺寸、内参、PnP 点序/消歧或绘制颜色时必须改注释。
  * light_ratio / center_distance / angle / light_angle_diff 只在构造函数算一次并写入成员；
  * 配对筛选和 overlay 必须读这些成员，禁止各自再算一遍。
+ * 法线 overlay 必须读 normal_cam，禁止显示时另从 rvec 算一遍。
  * 每个函数须写清作用/输入/输出；本文件内的 OpenCV 调用处也要注明。
  *
- * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角/灯条倾角差 → 画框 → IPPE PnP。
+ * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角/灯条倾角差 → 画框 → IPPE 双根 PnP。
  */
 #include "ArmorBoard.h"
 #include "Detector/detector_config.h"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
+
+#include <opencv2/calib3d.hpp>
+
+namespace {
+
+// 板心必须在相机前方这么远（mm）才算根有效；过近多半是歧义解。
+constexpr double kMinDepthMm = 50.0;
+// 超过这个深度（mm）当作飞点丢掉。
+constexpr double kMaxDepthMm = 20000.0;
+// 平均重投影超过这个像素数，这个根不可信。
+constexpr double kMaxReprojPx = 8.0;
+
+/**
+ * 作用：把 3D 物点投回图像，算四点平均像素误差。
+ * 输入：object/image 为 PnP 那四对点；r/t 为一个根；K/D 与求解同一套。
+ * 输出：平均 |投影-观测|（像素）。
+ */
+double meanReprojPx(const std::vector<cv::Point3f>& object_points,
+                    const std::vector<cv::Point2f>& image_points,
+                    const cv::Mat& rvec,
+                    const cv::Mat& tvec,
+                    const cv::Mat& K,
+                    const cv::Mat& D) {
+    std::vector<cv::Point2f> projected;
+    cv::projectPoints(object_points, rvec, tvec, K, D, projected);  // 物点+位姿 → 像素
+    double sum = 0.0;
+    for (size_t i = 0; i < image_points.size(); ++i)
+        sum += cv::norm(image_points[i] - projected[i]);
+    return sum / static_cast<double>(image_points.size());
+}
+
+/**
+ * 作用：物系 +Z 在相机系里的方向（R 的第三列）。
+ * 输入：rvec 为 Rodrigues 向量。输出：未归一化的相机系向量。
+ */
+cv::Vec3d objectZInCamera(const cv::Mat& rvec) {
+    cv::Mat R;
+    cv::Rodrigues(rvec, R);  // rvec → 3×3 旋转，列是物系轴在相机系的方向
+    R.convertTo(R, CV_64F);
+    return cv::Vec3d(R.at<double>(0, 2), R.at<double>(1, 2), R.at<double>(2, 2));
+}
+
+}  // namespace
 
 // 物点单位 mm。这是两灯条构成的矩形（不是外扩后的数字面）。
 // 默认与旧硬编码一致；loadPnpConfig 从 yaml 覆盖。改尺寸时 PnP 距离会一起变。
@@ -111,18 +156,65 @@ void ArmorBoard::draw_armor(cv::Mat& img) const {
 }
 
 /**
- * 作用：四共面点 IPPE PnP；物点 mm，距离换成米。
- * 输入：无（读 type 与四端点）。输出：成功且 z>0 为 true。
+ * 作用：把板法线画成箭头，方向远离相机。
+ * 输入：img 为 BGR。输出：无。必须读 normal_cam，与 solvePnP 写入的是同一个向量。
+ */
+void ArmorBoard::draw_normal(cv::Mat& img) const {
+    if (!pnp_ok || tvec.empty() || cv::norm(normal_cam) < 1e-6)
+        return;
+
+    cv::Mat t64;
+    tvec.convertTo(t64, CV_64F);
+    t64 = t64.reshape(1, 3);
+    const cv::Point3d origin(t64.at<double>(0, 0), t64.at<double>(1, 0), t64.at<double>(2, 0));
+    // 箭头长度 = 4 倍板高（约一块小板宽），比灯条高更易看出朝向；改倍率时同步改头文件注释。
+    const double height_mm = (type == ArmorType::LARGE) ? large_height_mm_ : small_height_mm_;
+    const double len = 4.0 * height_mm;
+    const cv::Point3d tip(origin.x + normal_cam[0] * len,
+                          origin.y + normal_cam[1] * len,
+                          origin.z + normal_cam[2] * len);
+    if (origin.z <= 1e-3 || tip.z <= 1e-3)
+        return;  // 有一端在相机后方，投影会翻到图像另一侧
+
+    // 点已在相机系：rvec/tvec 取零，只用与 PnP 相同的 K/D 投到像素。
+    const std::vector<cv::Point3f> cam_pts = {
+        cv::Point3f(static_cast<float>(origin.x), static_cast<float>(origin.y),
+                    static_cast<float>(origin.z)),
+        cv::Point3f(static_cast<float>(tip.x), static_cast<float>(tip.y),
+                    static_cast<float>(tip.z)),
+    };
+    const cv::Mat r0 = cv::Mat::zeros(3, 1, CV_64F);
+    const cv::Mat t0 = cv::Mat::zeros(3, 1, CV_64F);
+    std::vector<cv::Point2f> pix;
+    cv::projectPoints(cam_pts, r0, t0, camera_matrix_, dist_coeffs_, pix);
+    if (pix.size() != 2)
+        return;
+
+    const cv::Point p0(cvRound(pix[0].x), cvRound(pix[0].y));
+    const cv::Point p1(cvRound(pix[1].x), cvRound(pix[1].y));
+    // 品红：和金黄/绿板框、青字 overlay 分开，一眼能看法线。
+    const cv::Scalar magenta(255, 0, 255);
+    cv::arrowedLine(img, p0, p1, magenta, 2, cv::LINE_AA, 0, 0.25);
+}
+
+/**
+ * 作用：四共面点 IPPE 双根 PnP；选出板在前方且正面朝向相机的根；法线改存远离相机一侧。
+ * 输入：无（读 type 与四端点）。输出：成功且深度合法为 true。
  */
 bool ArmorBoard::solvePnP() {
     pnp_ok = false;
     dist_m = -1.0;
+    reproj_error_px = -1.0;
+    normal_cam = cv::Vec3d(0, 0, 0);
+    rvec.release();
+    tvec.release();
 
     const bool large = (type == ArmorType::LARGE);
     const float half_x = (large ? large_width_mm_ : small_width_mm_) * 0.5f;
     const float half_y = (large ? large_height_mm_ : small_height_mm_) * 0.5f;
 
     // 物点：左下起顺时针。Y 正方向朝板下方，与 OpenCV 图像 y 向下一致。
+    // +Z = X×Y：正面朝向相机时指向相机；画箭头时再翻成远离相机。
     const std::vector<cv::Point3f> object_points = {
         {-half_x, half_y, 0.f},   // 左下
         {-half_x, -half_y, 0.f},  // 左上
@@ -132,23 +224,77 @@ bool ArmorBoard::solvePnP() {
     const std::vector<cv::Point2f> image_points = {
         left_bottom, left_top, right_top, right_bottom};
 
-    cv::Mat r, t;
-    // solvePnP IPPE：四共面点位姿；失败再试 ITERATIVE。
-    bool ok = cv::solvePnP(object_points, image_points, camera_matrix_, dist_coeffs_,
-                           r, t, false, cv::SOLVEPNP_IPPE);
-    if (!ok)
-        ok = cv::solvePnP(object_points, image_points, camera_matrix_, dist_coeffs_,
-                          r, t, false, cv::SOLVEPNP_ITERATIVE);
-    if (!ok)
+    std::vector<cv::Mat> rvecs;
+    std::vector<cv::Mat> tvecs;
+    try {
+        // IPPE 平面四对应最多两个根；两个都留下，后面用朝向+重投影选。
+        cv::solvePnPGeneric(object_points, image_points, camera_matrix_, dist_coeffs_,
+                            rvecs, tvecs, false, cv::SOLVEPNP_IPPE);
+    } catch (const cv::Exception&) {
+        rvecs.clear();
+        tvecs.clear();
+    }
+
+    if (rvecs.empty() || tvecs.empty()) {
+        cv::Mat r, t;
+        // 双根失败再试迭代单根，避免偶发 IPPE 数值失败整帧没距离。
+        if (!cv::solvePnP(object_points, image_points, camera_matrix_, dist_coeffs_,
+                          r, t, false, cv::SOLVEPNP_ITERATIVE))
+            return false;
+        rvecs.push_back(r);
+        tvecs.push_back(t);
+    }
+
+    const size_t nroots = std::min(rvecs.size(), tvecs.size());
+    int best = -1;
+    bool best_faces_cam = false;
+    double best_err = std::numeric_limits<double>::infinity();
+
+    for (size_t i = 0; i < nroots; ++i) {
+        cv::Mat r64, t64;
+        rvecs[i].convertTo(r64, CV_64F);
+        tvecs[i].convertTo(t64, CV_64F);
+        t64 = t64.reshape(1, 3);
+        const double z = t64.at<double>(2, 0);
+        if (z < kMinDepthMm || z > kMaxDepthMm)
+            continue;
+
+        const double err = meanReprojPx(object_points, image_points, r64, t64,
+                                        camera_matrix_, dist_coeffs_);
+        if (err > kMaxReprojPx)
+            continue;
+
+        // 物系 +Z 的相机 z 分量：<0 表示板正面朝向我们（法线指向相机）。
+        const cv::Vec3d n = objectZInCamera(r64);
+        const bool faces_cam = n[2] < 0.0;
+
+        // 先保正面朝向我们的根（看得见灯条的那一面），同组里再取重投影更小的。
+        const bool better = (best < 0) ||
+                            (faces_cam && !best_faces_cam) ||
+                            (faces_cam == best_faces_cam && err < best_err);
+        if (!better)
+            continue;
+        best = static_cast<int>(i);
+        best_faces_cam = faces_cam;
+        best_err = err;
+        rvec = r64;
+        tvec = t64;
+    }
+
+    if (best < 0)
         return false;
 
-    const double z = t.at<double>(2);
-    if (z <= 1e-3)
-        return false;  // 相机后方，几何上不合理
+    cv::Vec3d n = objectZInCamera(rvec);
+    // 显示和后续车心要用「远离相机」：若 +Z 指向相机就取反，保证 n_z≥0。
+    if (n[2] < 0.0)
+        n = -n;
+    const double nlen = cv::norm(n);
+    if (nlen < 1e-9)
+        return false;
+    normal_cam = n / nlen;
 
-    rvec = r;
-    tvec = t;
-    dist_m = cv::norm(t) / 1000.0;  // mm → m
+    dist_m = cv::norm(tvec) / 1000.0;  // mm → m
+    reproj_error_px = best_err;
     pnp_ok = true;
     return true;
 }

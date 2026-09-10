@@ -26,6 +26,10 @@
  * 绝对值大于 max_light_angle_diff（配置默认 10°）不当装甲板。筛选和 overlay 都读这个字段。
  * 大小板：center_distance 落入小板或大板区间；分界读 min_large_center_distance。
  * PnP 物点：默认小板 135×55 mm、大板 225×55 mm，以配置 pnp 节为准（灯条矩形，不是数字面）。
+ * 物系：板在 z=0，X 右、Y 下（与图像一致），+Z = X×Y，板正面朝向相机时 +Z 指向相机。
+ * IPPE 有两个根：选 t.z>0 且板正面朝向相机（相机系 n_z<0）的那一个，重投影更小优先。
+ * normal_cam：板法线在相机系的单位向量，强制取远离相机的一侧（n_z≥0），给 overlay / 后续车心用。
+ * 检测画法线必须读 normal_cam，禁止显示时另从 rvec 推一遍。
  */
 enum class ArmorType { SMALL = 0, LARGE = 1 };
 
@@ -54,9 +58,11 @@ public:
     std::string classification_result;  // overlay 用，例如 "3:_92.0%"
     cv::Mat number_img;             // 单通道数字 ROI：大板 20×28，小板 26×28（宽+30%），与 CNN 同源；overlay 左上角贴这张
 
-    cv::Mat rvec;                   // PnP 旋转向量
+    cv::Mat rvec;                   // PnP 旋转向量（选中的 IPPE 根）
     cv::Mat tvec;                   // PnP 平移，单位 mm（与物点一致）
+    cv::Vec3d normal_cam{0, 0, 0};  // 相机系单位法线，指向远离相机（n_z≥0）；与 draw_normal 同源
     double dist_m = -1.0;           // ||tvec||/1000；<=0 表示未解或失败
+    double reproj_error_px = -1.0;  // 四点平均重投影误差（像素）；<0 表示未解
     bool pnp_ok = false;
 
     /**
@@ -97,9 +103,17 @@ public:
     void draw_armor(cv::Mat& img) const;
 
     /**
-     * 作用：用四灯条端点做 IPPE PnP，得到相机系平移（mm）和距离（m）。
+     * 作用：把板法线画成箭头，方向是远离相机（读 normal_cam，与 solvePnP 同一向量）。
+     * 原理：相机系 tvec 为起点，沿 normal_cam 走 4 倍板高（约一块板宽），用与 PnP 相同的 K/D 投到像素。
+     * 输入：img 为要画的 BGR 图（就地修改）。pnp_ok 为 false 时不画。
+     * 输出：无返回值。
+     */
+    void draw_normal(cv::Mat& img) const;
+
+    /**
+     * 作用：四共面点 IPPE 双根 PnP，选出板在相机前方、正面朝向我们的根，并写法线。
      * 输入：无（读 type、四端点和 loadPnpConfig 写入的内参/物点尺寸）。
-     * 输出：true 表示解出且 tvec.z>0；写入 rvec/tvec/dist_m/pnp_ok。
+     * 输出：true 表示解出且 tvec.z>0；写入 rvec/tvec/normal_cam/dist_m/reproj_error_px/pnp_ok。
      */
     bool solvePnP();
 

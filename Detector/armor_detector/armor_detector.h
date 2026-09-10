@@ -19,7 +19,7 @@
  * get_armors 每一步必须逐步注释（同色配对 / containLight / isArmor / 数字 / 贪心消共用灯 / PnP）。
  *
  * 装甲板检测：已检出的灯条 → 同色两两配对 → 包围盒不夹第三灯 → 几何像一块板
- * → CNN 认数字 → 贪心消共用灯（留置信度高的）→ IPPE PnP。
+ * → CNN 认数字 → 贪心消共用灯（留置信度高的）→ IPPE 双根 PnP（选正面朝向相机的根）。
  * 灯条本身仍由 LightDetector 提供，本类不改灯条源码。
  */
 struct ArmorParams {
