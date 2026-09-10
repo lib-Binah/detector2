@@ -16,7 +16,7 @@
  *   中心连线倾角 < max_angle；
  *   |Light::angle 左 - Light::angle 右| 不大于 max_light_angle_diff（配置默认 10°）。
  * 过关后透视数字、CNN 分类。一根灯条最多属于一块板：按 confidence 从高到低贪心占灯，
- * 共用灯条时留下模型置信度更高的那块。最后 IPPE 双根 PnP（写入 rvec/tvec/normal_cam）。
+ * 共用灯条时留下模型置信度更高的那块。最后 IPPE 初值 + 锁俯仰搜 yaw（写入 rvec/tvec/normal_cam）。
  */
 #include "armor_detector.h"
 #include "Detector/detector_config.h"
@@ -204,7 +204,7 @@ std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& ligh
     // 4) 贪心消共用灯：按 ArmorBoard::confidence 高→低占灯，一根灯条只留一块板。
     greedyResolveSharedLights(armors);
 
-    // 5) solvePnP：每块板 IPPE 双根，选正面朝向相机的根；失败只把 pnp_ok=false，几何板仍留下给 overlay。
+    // 5) solvePnP：IPPE 初值后锁安装俯仰只搜 yaw；失败只把 pnp_ok=false，几何板仍留下给 overlay。
     for (auto& armor : armors)
         armor.solvePnP();
 

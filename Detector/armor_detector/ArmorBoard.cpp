@@ -1,11 +1,11 @@
 /**
- * 注释契约：禁止随意删除本文件注释；改端点公式、物点尺寸、内参、PnP 点序/消歧或绘制颜色时必须改注释。
+ * 改端点公式、物点尺寸、内参、锁俯仰角、PnP 点序或绘制颜色时必须改注释。
  * light_ratio / center_distance / angle / light_angle_diff 只在构造函数算一次并写入成员；
  * 配对筛选和 overlay 必须读这些成员，禁止各自再算一遍。
  * 法线 overlay 必须读 normal_cam，禁止显示时另从 rvec 算一遍。
  * 每个函数须写清作用/输入/输出；本文件内的 OpenCV 调用处也要注明。
  *
- * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角/灯条倾角差 → 画框 → IPPE 双根 PnP。
+ * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角/灯条倾角差 → 画框 → IPPE 初值 + 锁俯仰搜 yaw。
  */
 #include "ArmorBoard.h"
 #include "Detector/detector_config.h"
@@ -71,6 +71,188 @@ cv::Vec3d awayNormalCam(const cv::Mat& rvec) {
     return n / len;
 }
 
+/**
+ * 作用：Huber，小误差二次、大误差线性，减轻角点外点对 yaw 搜索的拉力。
+ * 输入：error 为残差；delta 为二次/线性分界。输出：损失值。
+ */
+double huberLoss(double error, double delta) {
+    const double a = std::abs(error);
+    if (a <= delta)
+        return 0.5 * error * error;
+    return delta * (a - 0.5 * delta);
+}
+
+/**
+ * 作用：同济锁俯仰旋转。yaw 绕竖直、pitch 为安装角。
+ * 原理：第三列是物系 +Z。公式与 lovod/同济一致；pitch 取负的安装角，
+ * 使板面上沿更远、背离相机的法线略朝下（OpenCV y>0），俯仰不再是自由量。
+ * 输入：yaw、pitch 弧度。输出：3×3 的 R，X_cam = R * X_obj + t。
+ */
+cv::Mat buildLockedR(double yaw, double pitch) {
+    const double ys = std::sin(yaw);
+    const double yc = std::cos(yaw);
+    const double ps = std::sin(pitch);
+    const double pc = std::cos(pitch);
+    cv::Mat R(3, 3, CV_64F);
+    R.at<double>(0, 0) = yc;
+    R.at<double>(0, 1) = ys * ps;
+    R.at<double>(0, 2) = ys * pc;
+    R.at<double>(1, 0) = 0.0;
+    R.at<double>(1, 1) = pc;
+    R.at<double>(1, 2) = -ps;
+    R.at<double>(2, 0) = -ys;
+    R.at<double>(2, 1) = yc * ps;
+    R.at<double>(2, 2) = yc * pc;
+    return R;
+}
+
+/**
+ * 作用：固定 R，用无畸变像素射线最小二乘求 t（物点与 t 同一单位，这里是 mm）。
+ * 输入：R 为 3×3；object/image 为四对点；K/D 与 PnP 相同；t_mm 为初值并写回。
+ * 输出：true 表示 t 有限且深度在 [50,20000] mm。
+ */
+bool optimizeTranslationMm(const cv::Mat& R,
+                           const std::vector<cv::Point3f>& object_points,
+                           const std::vector<cv::Point2f>& image_points,
+                           const cv::Mat& K,
+                           const cv::Mat& D,
+                           cv::Mat& t_mm) {
+    std::vector<cv::Point2f> undistorted;
+    cv::undistortPoints(image_points, undistorted, K, D);  // 像素 → 归一化平面
+    cv::Mat A(8, 3, CV_64F);
+    cv::Mat b(8, 1, CV_64F);
+    for (int i = 0; i < 4; ++i) {
+        const cv::Mat pw = (cv::Mat_<double>(3, 1) << object_points[i].x, object_points[i].y,
+                            object_points[i].z);
+        const cv::Mat RP = R * pw;
+        const double mx = undistorted[i].x;
+        const double my = undistorted[i].y;
+        A.at<double>(2 * i, 0) = 1.0;
+        A.at<double>(2 * i, 1) = 0.0;
+        A.at<double>(2 * i, 2) = -mx;
+        b.at<double>(2 * i, 0) = mx * RP.at<double>(2, 0) - RP.at<double>(0, 0);
+        A.at<double>(2 * i + 1, 0) = 0.0;
+        A.at<double>(2 * i + 1, 1) = 1.0;
+        A.at<double>(2 * i + 1, 2) = -my;
+        b.at<double>(2 * i + 1, 0) = my * RP.at<double>(2, 0) - RP.at<double>(1, 0);
+    }
+    cv::Mat t;
+    if (!cv::solve(A, b, t, cv::DECOMP_QR))
+        return false;
+    t.convertTo(t, CV_64F);
+    t = t.reshape(1, 3);
+    const double tz = t.at<double>(2, 0);
+    if (!std::isfinite(t.at<double>(0, 0)) || !std::isfinite(t.at<double>(1, 0)) ||
+        !std::isfinite(tz) || tz < kMinDepthMm || tz > kMaxDepthMm)
+        return false;
+    t_mm = t;
+    return true;
+}
+
+/**
+ * 作用：锁俯仰后的 yaw 代价：四点位置 Huber + 边方向 Huber。
+ * 输入：R/t、物点/像点、K/D。输出：越小越贴图像。
+ */
+double yawReprojCost(const cv::Mat& R,
+                     const cv::Mat& t_mm,
+                     const std::vector<cv::Point3f>& object_points,
+                     const std::vector<cv::Point2f>& image_points,
+                     const cv::Mat& K,
+                     const cv::Mat& D) {
+    cv::Mat rvec;
+    cv::Rodrigues(R, rvec);
+    std::vector<cv::Point2f> projected;
+    cv::projectPoints(object_points, rvec, t_mm, K, D, projected);
+    double cost = 0.0;
+    constexpr double kHuberPx = 5.0;
+    constexpr double kHuberDeg = 10.0;
+    constexpr double kShapeW = 0.3;
+    for (int i = 0; i < 4; ++i) {
+        const double pos = cv::norm(image_points[i] - projected[i]);
+        cost += huberLoss(pos, kHuberPx);
+        const int j = (i + 1) % 4;
+        const cv::Point2f vo = image_points[j] - image_points[i];
+        const cv::Point2f vp = projected[j] - projected[i];
+        const double n1 = cv::norm(vo);
+        const double n2 = cv::norm(vp);
+        if (n1 < 1e-6 || n2 < 1e-6)
+            continue;
+        const double c = std::clamp((vo.x * vp.x + vo.y * vp.y) / (n1 * n2), -1.0, 1.0);
+        const double ang_deg = std::acos(c) * 180.0 / CV_PI;
+        cost += kShapeW * huberLoss(ang_deg, kHuberDeg);
+    }
+    return cost;
+}
+
+/**
+ * 作用：同济锁俯仰搜 yaw。IPPE 只提供 yaw/t 初值，俯仰被安装角钉死。
+ * 输入：四对点、K/D、安装角（板面朝斜上，度）、rvec/tvec 初值并写回。
+ * 输出：true 表示搜到合法 t；失败时不改 rvec/tvec。
+ */
+bool refineYawLockedPitch(const std::vector<cv::Point3f>& object_points,
+                          const std::vector<cv::Point2f>& image_points,
+                          const cv::Mat& K,
+                          const cv::Mat& D,
+                          double armor_pitch_deg,
+                          cv::Mat& rvec,
+                          cv::Mat& tvec) {
+    // 板面朝斜上 α：公式里 pitch 取 -α，背法线才略朝下且上沿更远。
+    const double pitch = -std::abs(armor_pitch_deg) * CV_PI / 180.0;
+    const cv::Vec3d away = awayNormalCam(rvec);
+    if (cv::norm(away) < 1e-9)
+        return false;
+    const double yaw0 = std::atan2(away[0], away[2]);
+
+    cv::Mat best_t = tvec.clone();
+    double best_yaw = yaw0;
+    double best_cost = std::numeric_limits<double>::infinity();
+
+    auto tryYaw = [&](double yaw, cv::Mat& t_io, double& cost_out) -> bool {
+        const cv::Mat R = buildLockedR(yaw, pitch);
+        cv::Mat t = t_io.clone();
+        if (!optimizeTranslationMm(R, object_points, image_points, K, D, t))
+            return false;
+        cost_out = yawReprojCost(R, t, object_points, image_points, K, D);
+        t_io = t;
+        return true;
+    };
+
+    // 粗搜 ±60° / 2°，再在最优附近 ±3° / 0.2°，与同济/lovod 前哨站 yaw 网格同结构。
+    for (double d = -60.0; d <= 60.0; d += 2.0) {
+        cv::Mat t = best_t.clone();
+        double cost = 0.0;
+        if (!tryYaw(yaw0 + d * CV_PI / 180.0, t, cost))
+            continue;
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_yaw = yaw0 + d * CV_PI / 180.0;
+            best_t = t;
+        }
+    }
+    if (!std::isfinite(best_cost))
+        return false;
+
+    double fine_yaw = best_yaw;
+    cv::Mat fine_t = best_t;
+    for (double d = -3.0; d <= 3.0; d += 0.2) {
+        cv::Mat t = best_t.clone();
+        double cost = 0.0;
+        if (!tryYaw(best_yaw + d * CV_PI / 180.0, t, cost))
+            continue;
+        if (cost < best_cost) {
+            best_cost = cost;
+            fine_yaw = best_yaw + d * CV_PI / 180.0;
+            fine_t = t;
+        }
+    }
+
+    cv::Mat rvec_out;
+    cv::Rodrigues(buildLockedR(fine_yaw, pitch), rvec_out);
+    rvec = rvec_out;
+    tvec = fine_t;
+    return true;
+}
+
 }  // namespace
 
 // 物点单位 mm。这是两灯条构成的矩形（不是外扩后的数字面）。
@@ -79,6 +261,7 @@ float ArmorBoard::small_width_mm_ = 135.f;
 float ArmorBoard::small_height_mm_ = 55.f;
 float ArmorBoard::large_width_mm_ = 225.f;
 float ArmorBoard::large_height_mm_ = 55.f;
+float ArmorBoard::armor_pitch_deg_ = 15.f;  // 板面朝斜上；锁进 R，同济方案消俯仰跳变
 
 // 与 detector/ArmorBoard.cpp、clone_detector/tools/detect_video.py 同一份默认内参；畸变置零。
 cv::Mat ArmorBoard::camera_matrix_ = (cv::Mat_<double>(3, 3) <<
@@ -171,6 +354,19 @@ void ArmorBoard::draw_armor(cv::Mat& img) const {
 }
 
 /**
+ * 作用：读 tvec 的相机系板心（mm）。
+ * 输入：无。输出：pnp_ok 且 tvec 非空时为平移；否则原点。
+ */
+cv::Point3d ArmorBoard::positionMm() const {
+    if (!pnp_ok || tvec.empty())
+        return cv::Point3d(0, 0, 0);
+    cv::Mat t64;
+    tvec.convertTo(t64, CV_64F);
+    t64 = t64.reshape(1, 3);
+    return cv::Point3d(t64.at<double>(0, 0), t64.at<double>(1, 0), t64.at<double>(2, 0));
+}
+
+/**
  * 作用：把板法线画成箭头，方向远离相机。
  * 输入：img 为 BGR。输出：无。必须读 normal_cam，与 solvePnP 写入的是同一个向量。
  */
@@ -213,7 +409,7 @@ void ArmorBoard::draw_normal(cv::Mat& img) const {
 }
 
 /**
- * 作用：四共面点 IPPE 双根 PnP；正面朝向相机，背法线锁定略朝下，避免俯仰跳变。
+ * 作用：IPPE 给初值，再锁安装俯仰只搜 yaw（同济方案），俯仰不再随双根跳变。
  * 输入：无（读 type 与四端点）。输出：成功且深度合法为 true。
  */
 bool ArmorBoard::solvePnP() {
@@ -307,19 +503,29 @@ bool ArmorBoard::solvePnP() {
     if (best < 0)
         return false;
 
+    // 同济：安装俯仰钉死，只搜 yaw。IPPE 的俯仰双根从此不再进入最终 R。
+    cv::Mat r_lock = rvec.clone();
+    cv::Mat t_lock = tvec.clone();
+    if (refineYawLockedPitch(object_points, image_points, camera_matrix_, dist_coeffs_,
+                             armor_pitch_deg_, r_lock, t_lock)) {
+        rvec = r_lock;
+        tvec = t_lock;
+    }
+
     const cv::Vec3d n = awayNormalCam(rvec);
     if (cv::norm(n) < 1e-9)
         return false;
     normal_cam = n;
 
     dist_m = cv::norm(tvec) / 1000.0;  // mm → m
-    reproj_error_px = best_err;
+    reproj_error_px = meanReprojPx(object_points, image_points, rvec, tvec,
+                                   camera_matrix_, dist_coeffs_);
     pnp_ok = true;
     return true;
 }
 
 /**
- * 作用：YAML pnp/camera → 静态物点尺寸与内参。
+ * 作用：YAML pnp/camera → 静态物点尺寸、安装俯仰、内参。
  * 输入：path。输出：true 表示打开成功。
  */
 bool ArmorBoard::loadPnpConfig(const std::string& path) {
@@ -332,6 +538,7 @@ bool ArmorBoard::loadPnpConfig(const std::string& path) {
     readYaml(pnp, "small_height_mm", small_height_mm_);
     readYaml(pnp, "large_width_mm", large_width_mm_);
     readYaml(pnp, "large_height_mm", large_height_mm_);
+    readYaml(pnp, "armor_pitch_deg", armor_pitch_deg_);
 
     const cv::FileNode cam = fs["camera"];
     double fx = camera_matrix_.at<double>(0, 0);

@@ -107,6 +107,21 @@ pnp:
   large_width_mm: 225.0
   # 大板高。
   large_height_mm: 55.0
+  # 板面朝斜上的安装角（度）。同济锁俯仰搜 yaw。
+  armor_pitch_deg: 15.0
+
+# ---------- 弹道预瞄 ----------
+aim:
+  bullet_speed_mps: 25.0
+  gravity_mps2: 9.81
+  iterations: 8
+  default_radius_m: 0.20
+  q_acc: 100.0
+  q_alpha: 400.0
+  max_dt_s: 0.10
+  min_detect_count: 3
+  max_temp_lost_count: 15
+  nis_fail_rate: 0.40
 
 # ---------- 相机内参 ----------
 camera:

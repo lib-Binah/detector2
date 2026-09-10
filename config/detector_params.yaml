@@ -107,6 +107,31 @@ pnp:
   large_width_mm: 225.0
   # 大板高度。
   large_height_mm: 55.0
+  # 板面朝斜上的安装角（度）。同济方案：俯仰当已知量只搜 yaw，避免 IPPE 法线上下跳。
+  armor_pitch_deg: 15.0
+
+# ---------- 弹道预瞄（Aim/；改弹速/半径会影响橙十字位置）----------
+aim:
+  # 出膛速度（m/s）。英雄更低、弹链更高时改这一项。
+  bullet_speed_mps: 25.0
+  # 重力（m/s²）。相机近似水平朝前时沿图像向下。
+  gravity_mps2: 9.81
+  # 飞行时间与落差互相迭代的次数。
+  iterations: 8
+  # 板心沿背法线推车心的半径（m）。EKF 初值 r，同济默认 0.2。
+  default_radius_m: 0.20
+  # 平移加速度方差（同济 piecewise white noise v1）。
+  q_acc: 100.0
+  # 角加速度方差（同济 v2）。
+  q_alpha: 400.0
+  # 帧间隔超过该秒数视为掉线，重置 EKF。
+  max_dt_s: 0.10
+  # 连续匹配这么多帧才从 detecting 进入 tracking。
+  min_detect_count: 3
+  # 短暂丢失超过这么多帧 → lost。
+  max_temp_lost_count: 15
+  # 近窗 NIS 失败比例超过则重置（同济 0.4）。
+  nis_fail_rate: 0.40
 
 # ---------- 相机内参（像素）；畸变默认全 0 ----------
 camera:
