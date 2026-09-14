@@ -8,7 +8,7 @@
 # ---------- 灯条：灰度分割 + 几何 ----------
 light:
   # 灰度二值下限：像素 > 该值视为灯条前景，再做闭运算。播放器 gray 进度条改的是同一项。
-  gray_thres: 120
+  gray_thres: 115
   # 闭运算椭圆核边长（像素）。只补灯芯小黑洞；太大易把两根灯粘在一起。须为奇数。
   close_ksize: 3
   # 细长比下限：Light::ratio = height/width。太胖的噪声丢掉。
@@ -117,15 +117,19 @@ aim:
   # 重力（m/s²）。相机近似水平朝前时沿图像向下。
   gravity_mps2: 9.81
   # 飞行时间与落差互相迭代的次数。
-  iterations: 8
+  iterations: 2
+  # 飞时 yaw += kw·ω·t。只乘预瞄用的角速度，不改 EKF。1=全额；<1 减小自旋提前。
+  w_lead_scale: 0.6
+  # 飞时 车心 += kv·v·t。只乘预瞄用的 vx/vy/vz，不改 EKF。1=全额；<1 减小平移提前。
+  v_lead_scale: 0.7
   # 板心沿背法线推车心的半径（m）。EKF 初值 r，同济默认 0.2。
-  default_radius_m: 0.20
+  default_radius_m: 0.30
   # 平移加速度方差（同济 piecewise white noise v1）。
-  q_acc: 100.0
+  q_acc: 100
   # 角加速度方差（同济 v2）。
-  q_alpha: 400.0
+  q_alpha: 400
   # 帧间隔超过该秒数视为掉线，重置 EKF。
-  max_dt_s: 0.10
+  max_dt_s: 0.15
   # 连续匹配这么多帧才从 detecting 进入 tracking。
   min_detect_count: 3
   # 短暂丢失超过这么多帧 → lost。

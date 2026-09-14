@@ -115,6 +115,10 @@ aim:
   bullet_speed_mps: 25.0
   gravity_mps2: 9.81
   iterations: 8
+  # 飞时 yaw += kw·ω·t。只乘预瞄用的角速度，不改 EKF。
+  w_lead_scale: 1.0
+  # 飞时 车心 += kv·v·t。只乘预瞄用的 vx/vy/vz，不改 EKF。
+  v_lead_scale: 1.0
   default_radius_m: 0.20
   q_acc: 100.0
   q_alpha: 400.0

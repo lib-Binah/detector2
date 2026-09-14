@@ -7,9 +7,10 @@
  * 检测门槛只从 yaml 读，调灯条/配对请用 armor_test。每个函数须写清作用、输入、输出。
  *
  * 两个窗口：
- *   displayimg   原图 + 可选灯条/装甲/距离/法线/车心/预测板/预瞄；顶栏 FPS；只留 frame 进度条
- *   aim vis      0/1 进度条：light / armor / dist / nml / hub / plates / aim / hud
- *                       nml 默认关；dist 读 ArmorBoard::dist_m
+ *   displayimg   原图 + 可选灯条/装甲/距离/法线/车心/速度/预测板/预瞄；顶栏 FPS；只留 frame 进度条
+ *   aim vis      0/1 进度条：light / armor / dist / nml / hub / vel / plates / aim / hud / txt
+ *                       nml 默认关；dist 读 ArmorBoard::dist_m；vel 读 EKF 车心 v 与 ω
+ *                       txt=0 时不画画面上的字（距离/速度/状态），框和准星仍画
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。Seek 会重置 EKF。
  */
@@ -53,9 +54,11 @@ int overlay_armor = 1;   // ArmorBoard::draw_armor
 int overlay_dist = 1;    // ArmorBoard::dist_m（与 PnP 同一距离）
 int overlay_nml = 0;     // ArmorBoard::draw_normal，默认关
 int overlay_hub = 1;     // EKF 车心
+int overlay_vel = 1;     // 车心线速度 |v|、角速度 ω，读 AimTarget 的 EKF 速度
 int overlay_plates = 1;  // EKF 预测的 n 块板
 int overlay_aim = 1;     // 弹道预瞄十字（v、ω 飞时超前 + 重力）
-int overlay_hud = 1;     // 状态文字
+int overlay_hud = 1;     // 状态文字：id / tracking / 飞时
+int overlay_txt = 1;     // 总开关：0 不画画面文字（dist/vel/hud），几何 overlay 不受影响
 
 /**
  * 作用：只在播出新帧时刷新 FPS。
@@ -173,7 +176,7 @@ void drawArmorDistances(Mat& img, const std::vector<ArmorBoard>& armors) {
  * 作用： vis 开关说明图。输入：无。输出：BGR 说明。
  */
 Mat makeVisLegend() {
-    Mat panel(222, 520, CV_8UC3, Scalar(28, 28, 28));
+    Mat panel(266, 540, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "0=hide  1=show   (displayimg)", Point(8, 22), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(0, 200, 100), kFontThick, LINE_AA);
     putText(panel, "light / armor = detector boxes", Point(8, 44), FONT_HERSHEY_SIMPLEX, 0.42,
@@ -184,13 +187,17 @@ Mat makeVisLegend() {
             0.42, Scalar(255, 0, 255), kFontThick, LINE_AA);
     putText(panel, "hub=cyan  EKF rotation center", Point(8, 110), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(255, 255, 0), kFontThick, LINE_AA);
-    putText(panel, "plates=green  predicted armor centers", Point(8, 132), FONT_HERSHEY_SIMPLEX, 0.42,
+    putText(panel, "vel=hub v m/s and w rad/s  (EKF vx,vy,vz,vyaw)", Point(8, 132),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(255, 255, 0), kFontThick, LINE_AA);
+    putText(panel, "plates=green  predicted armor centers", Point(8, 154), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(0, 220, 0), kFontThick, LINE_AA);
-    putText(panel, "aim=orange  lead with v,w then gravity", Point(8, 154), FONT_HERSHEY_SIMPLEX,
+    putText(panel, "aim=orange  lead with kv*v, kw*w then gravity", Point(8, 176), FONT_HERSHEY_SIMPLEX,
             0.42, Scalar(0, 140, 255), kFontThick, LINE_AA);
-    putText(panel, "hud=id / state / |v| / omega / t", Point(8, 176), FONT_HERSHEY_SIMPLEX, 0.42,
+    putText(panel, "hud=id / state / t", Point(8, 198), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(180, 180, 180), kFontThick, LINE_AA);
-    putText(panel, "detection params: yaml only (use armor_test)", Point(8, 198),
+    putText(panel, "txt=overlay text (dist/vel/hud); boxes stay", Point(8, 220), FONT_HERSHEY_SIMPLEX,
+            0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
+    putText(panel, "detection params: yaml only (use armor_test)", Point(8, 242),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
     return panel;
 }
@@ -318,9 +325,11 @@ int main(int argc, char** argv) {
     createTrackbar("dist", win_vis, &overlay_dist, 1);  // 0/1：板旁距离，读 dist_m
     createTrackbar("nml", win_vis, &overlay_nml, 1);  // 默认 0
     createTrackbar("hub", win_vis, &overlay_hub, 1);
+    createTrackbar("vel", win_vis, &overlay_vel, 1);  // 0/1：车心 v 与 ω，读 EKF
     createTrackbar("plates", win_vis, &overlay_plates, 1);
     createTrackbar("aim", win_vis, &overlay_aim, 1);
     createTrackbar("hud", win_vis, &overlay_hud, 1);
+    createTrackbar("txt", win_vis, &overlay_txt, 1);  // 0/1：画面文字总开关，几何仍画
 
     auto syncTrackbar = [&]() {
         scrubber.syncing = true;
@@ -382,14 +391,16 @@ int main(int argc, char** argv) {
             for (auto& armor : armors)
                 armor.draw_armor(vis);
         }
-        if (overlay_dist)
-            drawArmorDistances(vis, armors);  // 读 ArmorBoard::dist_m
+        if (overlay_dist && overlay_txt)
+            drawArmorDistances(vis, armors);  // 读 ArmorBoard::dist_m；受 txt 总开关
         if (overlay_nml) {
             for (const auto& armor : armors)
                 armor.draw_normal(vis);  // 读 normal_cam
         }
+        // txt=0 时 vel/hud 的 putText 关掉，hub/plates/aim 几何仍按各自开关画
         const AimDrawFlags flags{overlay_hub != 0, overlay_plates != 0, overlay_aim != 0,
-                                 overlay_hud != 0};
+                                 overlay_hud != 0 && overlay_txt != 0,
+                                 overlay_vel != 0 && overlay_txt != 0};
         aimer.draw(vis, aim_tgt, flags);  // 读 AimTarget 像素
 
         Mat shown = scaleTo1080(makeDisplayCanvas(vis, is_show_fps ? fps : 0.0), &display_scale,
