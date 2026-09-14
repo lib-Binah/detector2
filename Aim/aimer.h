@@ -29,7 +29,7 @@ struct AimParams {
 
 struct AimDrawFlags {
     bool hub = true;     // 青圈：EKF 车心
-    bool plates = true;  // 绿圈：当前时刻四块预测板
+    bool plates = true;  // 半透明色块：EKF 预测的 n 块板面（与 PnP 同尺寸）
     bool aim = true;     // 橙十字：弹道瞄准点
     bool hud = true;     // 文字：id/状态/飞时
     bool vel = true;     // 车心旁：线速度 |v| 与角速度 ω，读 EKF vx/vy/vz/vyaw
@@ -53,6 +53,8 @@ struct AimTarget {
     cv::Point2f hub_px{-1.f, -1.f};
     cv::Point2f aim_px{-1.f, -1.f};
     std::vector<cv::Point2f> plate_px;
+    // 每块预测板四角像素（左下、左上、右上、右下），与 ArmorBoard::projectArmorQuad / PnP 物点同源。
+    std::vector<std::vector<cv::Point2f>> plate_quads;
     BallisticSolution ballistic;
 };
 
@@ -86,8 +88,8 @@ public:
     AimTarget update(const std::vector<ArmorBoard>& armors, double dt);
 
     /**
-     * 作用：把车心/预测板/瞄准点/车心速度画到图上，读 AimTarget 已有量，不另算 EKF。
-     * v/ω 旁的 kv、kw 读 params_，与飞时外推同一项。
+     * 作用：把车心/预测板矩形/瞄准点/车心速度画到图上，读 AimTarget 已有量，不另算 EKF。
+     * 预测板四角读 plate_quads（与 PnP 同物点）；v/ω 旁的 kv、kw 读 params_。
      * 输入：img 为 BGR；tgt 为 update 结果；flags 为各开关。ok=false 时不画。
      * 输出：无。
      */

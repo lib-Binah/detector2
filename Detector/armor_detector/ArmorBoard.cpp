@@ -3,6 +3,7 @@
  * light_ratio / center_distance / angle / light_angle_diff 只在构造函数算一次并写入成员；
  * 配对筛选和 overlay 必须读这些成员，禁止各自再算一遍。
  * 法线 overlay 必须读 normal_cam，禁止显示时另从 rvec 算一遍。
+ * 预测板矩形必须走 projectArmorQuad（与 solvePnP 同一物点和锁俯仰 R）。
  * 每个函数须写清作用/输入/输出；本文件内的 OpenCV 调用处也要注明。
  *
  * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角/灯条倾角差 → 画框 → IPPE 初值 + 锁俯仰搜 yaw。
@@ -364,6 +365,40 @@ cv::Point3d ArmorBoard::positionMm() const {
     tvec.convertTo(t64, CV_64F);
     t64 = t64.reshape(1, 3);
     return cv::Point3d(t64.at<double>(0, 0), t64.at<double>(1, 0), t64.at<double>(2, 0));
+}
+
+/**
+ * 作用：预测板心+yaw → 四角像素。物点与锁俯仰 R 和 solvePnP / buildLockedR 同一套。
+ * 输入：center_mm、yaw_rad、type。输出：左下、左上、右上、右下；相机后方为空。
+ */
+std::vector<cv::Point2f> ArmorBoard::projectArmorQuad(const cv::Point3d& center_mm, double yaw_rad,
+                                                      ArmorType type) {
+    if (center_mm.z <= 1.0)
+        return {};
+    const bool large = (type == ArmorType::LARGE);
+    const float half_x = (large ? large_width_mm_ : small_width_mm_) * 0.5f;
+    const float half_y = (large ? large_height_mm_ : small_height_mm_) * 0.5f;
+    // 与 solvePnP 同一物点：左下起顺时针，Y 向下。
+    const std::vector<cv::Point3f> object_points = {
+        {-half_x, half_y, 0.f},
+        {-half_x, -half_y, 0.f},
+        {half_x, -half_y, 0.f},
+        {half_x, half_y, 0.f},
+    };
+    const double pitch = -std::abs(static_cast<double>(armor_pitch_deg_)) * CV_PI / 180.0;
+    const cv::Mat R = buildLockedR(yaw_rad, pitch);  // 与 PnP 锁俯仰同一 R
+    cv::Mat tvec = (cv::Mat_<double>(3, 1) << center_mm.x, center_mm.y, center_mm.z);
+    for (const auto& op : object_points) {
+        const cv::Mat pw = (cv::Mat_<double>(3, 1) << op.x, op.y, op.z);
+        const cv::Mat pc = R * pw + tvec;
+        if (pc.at<double>(2, 0) <= 1.0)
+            return {};
+    }
+    cv::Mat rvec;
+    cv::Rodrigues(R, rvec);
+    std::vector<cv::Point2f> pix;
+    cv::projectPoints(object_points, rvec, tvec, camera_matrix_, dist_coeffs_, pix);
+    return pix;
 }
 
 /**

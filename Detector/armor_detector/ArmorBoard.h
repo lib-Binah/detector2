@@ -3,6 +3,7 @@
 
 #include <opencv2/opencv.hpp>
 #include <string>
+#include <vector>
 
 #include "Light.h"
 
@@ -136,6 +137,15 @@ public:
      * 输入：无。输出：1×5 畸变常引用。
      */
     static const cv::Mat& distCoeffs() { return dist_coeffs_; }
+
+    /**
+     * 作用：EKF 预测板心+yaw → 板面四角像素，物点尺寸和锁俯仰 R 必须与 solvePnP 同一套。
+     * 原理：物点左下/左上/右上/右下（mm，Y 向下），R = 锁安装俯仰的 yaw 旋转，t = 板心。
+     * 输入：center_mm 与 positionMm 同一相机系；yaw_rad 与 atan2(normal.x, normal.z) 同一水平角；type 定大小板。
+     * 输出：4 个像素点（左下、左上、右上、右下）；任一点在相机后方则空。
+     */
+    static std::vector<cv::Point2f> projectArmorQuad(const cv::Point3d& center_mm, double yaw_rad,
+                                                     ArmorType type);
 
     /**
      * 作用：从 YAML 的 pnp / camera 节点写入物点尺寸和内参。

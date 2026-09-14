@@ -144,8 +144,13 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
     tgt.vyaw_rad_s = tracker_.ekf().x[7];
     tgt.nis = tracker_.ekf().last_nis;
     tgt.phase_id = tracker_.lastPhaseId();
-    for (const auto& p : plates_now)
-        tgt.plate_px.push_back(projectCamMm(xyzaToMm(p)));
+    const ArmorType plate_type = tracker_.trackedType();
+    for (const auto& p : plates_now) {
+        const cv::Point3d mm = xyzaToMm(p);
+        tgt.plate_px.push_back(projectCamMm(mm));
+        // 板心+yaw → 与 PnP 同尺寸四角，贴在车四周。
+        tgt.plate_quads.push_back(ArmorBoard::projectArmorQuad(mm, p[3], plate_type));
+    }
 
     int phase = tgt.phase_id;
     cv::Point3d shot = xyzaToMm(plates_now[static_cast<std::size_t>(
@@ -185,8 +190,8 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
 }
 
 /**
- * 作用：青圈车心、绿圈预测板、橙十字弹道点、车心速度文字；读 AimTarget，不另算 v/ω。
- * k 画在 v/ω 旁，与飞时用的 v_lead_scale、w_lead_scale 同一字段。
+ * 作用：青圈车心、四周预测板色块、橙十字弹道点、车心速度文字；读 AimTarget，不另算 v/ω。
+ * 板矩形读 plate_quads（与 PnP 同物点）；k 画在 v/ω 旁，与飞时系数同一字段。
  * 输入：BGR 图、update 结果、开关。输出：无。
  */
 void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) const {
@@ -210,7 +215,57 @@ void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) 
                     cv::Point(c.x + 10, c.y + 30), cv::FONT_HERSHEY_PLAIN, 0.95, cyan, 1,
                     cv::LINE_AA);
     }
-    if (flags.plates) {
+    if (flags.plates && !tgt.plate_quads.empty()) {
+        // 相位 0..3：绿 / 橙 / 黄 / 品红，半透明盖在预测板面上，与检测金框区分。
+        const cv::Scalar kFill[] = {
+            cv::Scalar(0, 220, 0),
+            cv::Scalar(0, 140, 255),
+            cv::Scalar(0, 255, 255),
+            cv::Scalar(255, 0, 255),
+        };
+        constexpr double kAlpha = 0.38;
+        cv::Mat wash = img.clone();
+        for (std::size_t i = 0; i < tgt.plate_quads.size(); ++i) {
+            const auto& q = tgt.plate_quads[i];
+            if (q.size() != 4)
+                continue;
+            std::vector<cv::Point> poly;
+            poly.reserve(4);
+            bool skip = false;
+            for (const auto& p : q) {
+                if (!std::isfinite(p.x) || !std::isfinite(p.y)) {
+                    skip = true;
+                    break;
+                }
+                poly.emplace_back(cvRound(p.x), cvRound(p.y));
+            }
+            if (skip)
+                continue;
+            const cv::Scalar& c = kFill[i % 4];
+            cv::fillConvexPoly(wash, poly, c, cv::LINE_AA);
+        }
+        cv::addWeighted(wash, kAlpha, img, 1.0 - kAlpha, 0.0, img);
+        for (std::size_t i = 0; i < tgt.plate_quads.size(); ++i) {
+            const auto& q = tgt.plate_quads[i];
+            if (q.size() != 4)
+                continue;
+            std::vector<cv::Point> poly;
+            poly.reserve(4);
+            bool skip = false;
+            for (const auto& p : q) {
+                if (!std::isfinite(p.x) || !std::isfinite(p.y)) {
+                    skip = true;
+                    break;
+                }
+                poly.emplace_back(cvRound(p.x), cvRound(p.y));
+            }
+            if (skip)
+                continue;
+            const cv::Scalar& c = kFill[i % 4];
+            const bool aimed = tgt.ok && static_cast<int>(i) == tgt.phase_id;
+            cv::polylines(img, poly, true, c, aimed ? 3 : 2, cv::LINE_AA);
+        }
+    } else if (flags.plates) {
         for (const auto& px : tgt.plate_px) {
             if (px.x >= 0.f)
                 cv::circle(img, px, 7, cv::Scalar(0, 220, 0), 1, cv::LINE_AA);

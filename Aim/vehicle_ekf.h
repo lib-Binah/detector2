@@ -54,6 +54,11 @@ public:
     int trackedId() const { return tracked_id_; }
     int armorNum() const { return armor_num_; }
     /**
+     * 作用：当前锁的大小板类型，给预测板矩形用同一套物点宽高。
+     * 输入：无。输出：setTarget 写入的 SMALL/LARGE；无目标时为 SMALL。
+     */
+    ArmorType trackedType() const { return tracked_type_; }
+    /**
      * 作用：本帧匹配到的装甲相位（0..n-1），给飞时超前锁定同一块板。
      * 输入：无。输出：无目标时为 0。
      */
