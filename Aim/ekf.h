@@ -11,8 +11,9 @@
  * NIS 窗口或残差折角时必须改注释。每个函数须写清作用、输入、输出。
  *
  * 通用扩展卡尔曼滤波（对齐 TongjiSuperPower/sp_vision_25 tools::ExtendedKalmanFilter）。
- * 过程/量测函数由整车模型注入；本类只做 x=f(x)、P=FPFᵀ+Q、Joseph 更新和 NIS。
+ * 过程/量测函数由整车模型注入；本类只做 x=f(x)、P=FPFᵀ+Q、Joseph 更新、NIS/NEES。
  * yaw 等角度维用 x_add / z_subtract 折到 ±π，禁止直接 a-b 把 359° 当成大残差。
+ * NIS 门槛与同济源码一致为 0.711（他们按 4 维 χ² 0.95 标注，数值本身过严）。
  */
 class ExtendedKalmanFilter {
 public:
@@ -22,7 +23,7 @@ public:
 
     Eigen::VectorXd x;
     Eigen::MatrixXd P;
-    std::map<std::string, double> data;
+    std::map<std::string, double> data;  // 同济：残差、nis/nees、窗口失败率
     std::deque<int> recent_nis_failures{0};
     std::size_t window_size = 100;
     double last_nis = 0.0;
@@ -63,8 +64,8 @@ public:
                            });
 
     /**
-     * 作用：非线性量测更新（Joseph 形式保持 P 对称正定），并记 NIS 供发散检测。
-     * 输入：z、H、R、h(x)、z_subtract。输出：更新后的 x；data["nis"] 为卡方量。
+     * 作用：非线性量测更新（Joseph 形式保持 P 对称正定），并记 NIS/NEES 供发散检测。
+     * 输入：z、H、R、h(x)、z_subtract。输出：更新后的 x；data["nis"] 为后验卡方量。
      */
     Eigen::VectorXd update(const Eigen::VectorXd& z, const Eigen::MatrixXd& H, const Eigen::MatrixXd& R,
                            const VectorFunc& h, VectorSub z_subtract);
@@ -72,6 +73,9 @@ public:
 private:
     Eigen::MatrixXd I_;
     VectorAdd x_add_;
+    int nees_count_ = 0;
+    int nis_count_ = 0;
+    int total_count_ = 0;
 };
 
 #endif  // AIM_EKF_H

@@ -20,28 +20,21 @@
  * 装甲 yaw = atan2(normal_cam.x, normal_cam.z)，与 overlay 法线同一向量。
  * 同济长短轴：前后板半径 r、高度 yc；左右板半径 r+l、高度 yc+h。对侧共用，没有四套半径。
  * l = r_左右 − r_前后，h = y_左右 − y_前后（本相机系 Y 向下）。
- * 圆周：xa = xc - r sin(yaw+id·2π/n)，za = zc - r cos(yaw+id·2π/n)；
- * 与 init 的 xc = xa + r sinθ 互为逆。四装甲时 id=1/3 用 r+l 和 yc+h。
- * 量测 z = (LOS yaw, LOS pitch, 距离, 装甲 yaw)，H = H_ypd · H_xyza。
- * 只看见一块板时不更新 r（zc 与 r 不可区分）；l/h 在匹配到侧面（id=1/3）时仍更新。
- * 同帧两块同号板才放开 r。
+ * 圆周（相机系，对应同济世界系的 cos/sin 互换）：xa = xc - r sin(yaw+id·2π/n)，
+ * za = zc - r cos(yaw+id·2π/n)；与 init 的 xc = xa + r sinθ 互为逆。
+ * 四装甲 id=1/3 用 r+l 和 yc+h。量测 z = (LOS yaw, pitch, 距离, 装甲 yaw)，H = H_ypd · H_xyza。
+ * 同济每块可见板都做 ypda 更新，不冻 r；l/h 只在 id=1/3 的雅可比里非零。
+ * 锁车只按最近一块板 + 给定半径 init，l=h=0，P0 的 r/l/h 为 1；量测从下一帧开始。
  */
 struct VehicleEkfParams {
-    // 单板锁车：沿背法线推车心的 r 初值（米）。yaml aim.default_radius_m 覆盖此项。
-    // 同帧有两块同号板时改由背法线交点估 r，不用这个数当圆半径。
-    double default_radius_m = 0.25;
-    // 同济 l：左右半径减前后半径。yaml aim.init_l_m。正值左右更靠外。
-    double init_l_m = 0.0;
-    // 同济 h：左右相对前后的高度差。yaml aim.init_h_m。相机 Y 向下，左右更高则为负。
-    double init_h_m = 0.0;
-    // 初始化时把车心沿相机 -Y 抬高这么多米（画面向上、离开地面）。车心偏低、整圈扎地时加大。
-    double init_hub_up_m = 0.0;
+    // 同济步兵/英雄/平衡：沿板背法线推车心的 r 初值（米）。yaml aim.default_radius_m，默认 0.2。
+    double default_radius_m = 0.20;
     double q_acc = 100.0;            // 平移加速度方差（同济 piecewise white noise v1）
     double q_alpha = 400.0;          // 角加速度方差（同济 v2）
-    double max_dt_s = 0.10;          // 帧间隔超过则当相机掉线，重置
+    double max_dt_s = 0.10;          // 同济相机离线门槛 0.1s
     int min_detect_count = 3;        // 连续匹配这么多帧才从 detecting → tracking
     int max_temp_lost_count = 15;    // 短暂丢失超过这么多帧 → lost
-    double nis_fail_rate = 0.40;     // 近窗 NIS 失败比例超此值视为未收敛
+    double nis_fail_rate = 0.40;     // 窗内 NIS 失败次数 ≥ 该比例×window_size 则重置（同济 0.4×100）
 };
 
 enum class VehicleTrackState {
@@ -56,7 +49,7 @@ public:
     VehicleTracker() = default;
 
     /**
-     * 作用：从 YAML 的 aim 节点读半径/侧板初值、Q、状态机门槛。
+     * 作用：从 YAML 的 aim 节点读半径、Q、状态机与 NIS 门槛。
      * 输入：path 为 detector_params.yaml。输出：true 表示文件打开成功；缺键保持默认。
      */
     bool loadConfig(const std::string& path);
@@ -124,8 +117,8 @@ private:
     bool setTarget(const std::vector<ArmorBoard>& armors);
     bool updateTarget(const std::vector<ArmorBoard>& armors, double dt);
     void stateMachine(bool found);
-    void initEkf(const ArmorBoard& armor, const std::vector<ArmorBoard>& armors);
-    void updateYpda(const ArmorBoard& armor, int phase_id, bool freeze_radius);
+    void initEkf(const ArmorBoard& armor);
+    void updateYpda(const ArmorBoard& armor, int phase_id);
     Eigen::Vector3d armorXyz(const Eigen::VectorXd& x, int id) const;
     Eigen::MatrixXd hJacobian(const Eigen::VectorXd& x, int id) const;
     static int armorCountFor(const ArmorBoard& armor);
