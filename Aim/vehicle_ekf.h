@@ -23,7 +23,15 @@
  * 量测 z = (LOS yaw, LOS pitch, 距离, 装甲 yaw)，H = H_ypd · H_xyza。
  */
 struct VehicleEkfParams {
-    double default_radius_m = 0.20;  // 看不见车心时沿背法线推这么远
+    // 单板锁车：沿背法线推车心的 r 初值（米）。yaml aim.default_radius_m 覆盖此项。
+    // 同帧有两块同号板时改由背法线交点估 r，不用这个数当圆半径。
+    double default_radius_m = 0.25;
+    // 四装甲侧板（id=1/3）半径 = r+l。yaml aim.init_l_m。正值侧板更靠外。
+    double init_l_m = 0.0;
+    // 侧板高度 y = yc+h（相机 Y 向下）。yaml aim.init_h_m。只动 1/3 相位，不抬车心。
+    double init_h_m = 0.0;
+    // 初始化时把车心沿相机 -Y 抬高这么多米（画面向上、离开地面）。车心偏低、整圈扎地时加大。
+    double init_hub_up_m = 0.0;
     double q_acc = 100.0;            // 平移加速度方差（同济 piecewise white noise v1）
     double q_alpha = 400.0;          // 角加速度方差（同济 v2）
     double max_dt_s = 0.10;          // 帧间隔超过则当相机掉线，重置
@@ -44,7 +52,7 @@ public:
     VehicleTracker() = default;
 
     /**
-     * 作用：从 YAML 的 aim 节点读半径、Q、状态机门槛。
+     * 作用：从 YAML 的 aim 节点读半径/侧板初值、Q、状态机门槛。
      * 输入：path 为 detector_params.yaml。输出：true 表示文件打开成功；缺键保持默认。
      */
     bool loadConfig(const std::string& path);
@@ -112,7 +120,7 @@ private:
     bool setTarget(const std::vector<ArmorBoard>& armors);
     bool updateTarget(const std::vector<ArmorBoard>& armors, double dt);
     void stateMachine(bool found);
-    void initEkf(const ArmorBoard& armor);
+    void initEkf(const ArmorBoard& armor, const std::vector<ArmorBoard>& armors);
     void updateYpda(const ArmorBoard& armor, int phase_id);
     Eigen::Vector3d armorXyz(const Eigen::VectorXd& x, int id) const;
     Eigen::MatrixXd hJacobian(const Eigen::VectorXd& x, int id) const;

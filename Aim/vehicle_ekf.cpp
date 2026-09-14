@@ -45,6 +45,63 @@ Eigen::Vector3d armorXyzM(const ArmorBoard& a) {
 }
 
 /**
+ * 作用：水平背法线（与 init 的 sin/cos 同一套，远离相机）。
+ * 输入：板。输出：XZ 单位方向。
+ */
+Eigen::Vector2d armorBackNxz(const ArmorBoard& a) {
+    const double yaw = armorYaw(a);
+    return {std::sin(yaw), std::cos(yaw)};
+}
+
+/**
+ * 作用：两块同车板的背法线求车心和 r，让两块都落在圆上。
+ * 原理：车心 = 板心 + s·n；相邻板解交点，对侧板取中点。s,t 须像真实半径。
+ * 输入：两块 pnp_ok 的板。输出：true 时写入 xc,zc,r（米）。
+ */
+bool hubFromTwoPlates(const ArmorBoard& a, const ArmorBoard& b, double& xc, double& zc, double& r) {
+    const Eigen::Vector3d pa = armorXyzM(a);
+    const Eigen::Vector3d pb = armorXyzM(b);
+    const Eigen::Vector2d p1(pa[0], pa[2]);
+    const Eigen::Vector2d p2(pb[0], pb[2]);
+    if ((p1 - p2).norm() < 0.08)
+        return false;  // 同一块板的重复检测
+    const Eigen::Vector2d n1 = armorBackNxz(a);
+    const Eigen::Vector2d n2 = armorBackNxz(b);
+    constexpr double kRmin = 0.08;
+    constexpr double kRmax = 0.45;
+    const double ndot = n1.dot(n2);
+
+    if (ndot < -0.7) {
+        // 法线接近相反：对侧装甲，车心在中点，r 为间距一半。
+        const Eigen::Vector2d mid = 0.5 * (p1 + p2);
+        const double rr = (p1 - mid).norm();
+        if (rr < kRmin || rr > kRmax)
+            return false;
+        xc = mid[0];
+        zc = mid[1];
+        r = rr;
+        return true;
+    }
+
+    Eigen::Matrix2d A;
+    A << n1[0], -n2[0], n1[1], -n2[1];
+    if (std::abs(A.determinant()) < 1e-4)
+        return false;
+    const Eigen::Vector2d st = A.inverse() * (p2 - p1);
+    const double s = st[0];
+    const double t = st[1];
+    if (s < kRmin || s > kRmax || t < kRmin || t > kRmax)
+        return false;
+    if (std::abs(s - t) > 0.12)
+        return false;
+    const Eigen::Vector2d hub = p1 + s * n1;
+    xc = hub[0];
+    zc = hub[1];
+    r = 0.5 * (s + t);
+    return true;
+}
+
+/**
  * 作用：视线 ypd。相机 X 右 Y 下 Z 前：yaw=atan2(x,z)，pitch=atan2(y,hypot(x,z))。
  * 输入：相机系米。输出：(yaw, pitch, distance)。
  */
@@ -117,7 +174,7 @@ Eigen::MatrixXd processQ(double dt, double v1, double v2) {
 }  // namespace
 
 /**
- * 作用：YAML aim → 半径/Q/状态机。输入：path。输出：打开成功为 true。
+ * 作用：YAML aim → 半径/侧板初值/Q/状态机。输入：path。输出：打开成功为 true。
  */
 bool VehicleTracker::loadConfig(const std::string& path) {
     cv::FileStorage fs;
@@ -125,6 +182,9 @@ bool VehicleTracker::loadConfig(const std::string& path) {
         return false;
     const cv::FileNode n = fs["aim"];
     readYaml(n, "default_radius_m", params_.default_radius_m);
+    readYaml(n, "init_l_m", params_.init_l_m);  // 侧板半径增量初值
+    readYaml(n, "init_h_m", params_.init_h_m);  // 侧板高度差初值
+    readYaml(n, "init_hub_up_m", params_.init_hub_up_m);  // 车心上抬，不改侧板 h
     readYaml(n, "q_acc", params_.q_acc);
     readYaml(n, "q_alpha", params_.q_alpha);
     readYaml(n, "max_dt_s", params_.max_dt_s);
@@ -186,8 +246,8 @@ void VehicleTracker::step(const std::vector<ArmorBoard>& armors, double dt) {
 }
 
 /**
- * 作用：在 pnp_ok 的板里选最近那辆车（同数字合成一辆），用这块板初始化 EKF。
- * 输入：本帧装甲。输出：true 表示已 init。
+ * 作用：在 pnp_ok 的板里选最近那辆车（同数字合成一辆），初始化 EKF。
+ * 输入：本帧装甲。输出：true 表示已 init；同帧可见板会再做一次 dt=0 更新。
  */
 bool VehicleTracker::setTarget(const std::vector<ArmorBoard>& armors) {
     const ArmorBoard* best = nullptr;
@@ -205,24 +265,51 @@ bool VehicleTracker::setTarget(const std::vector<ArmorBoard>& armors) {
     tracked_id_ = best->number;
     tracked_type_ = best->type;
     armor_num_ = armorCountFor(*best);
-    initEkf(*best);
+    initEkf(*best, armors);           // 单板用 yaml 半径；两块同号则交点估 r
+    updateTarget(armors, 0.0);        // 第一帧 dt=0：不预测，把可见板都更新进后验
     return true;
 }
 
 /**
- * 作用：板心沿背法线推 r，写入 11 维初值（速度为 0）。
- * 输入：选用板。输出：ekf_ 已 init。
+ * 作用：写入 11 维初值。一块板沿背法线推 yaml 半径；两块同号板则用交点估 r、车心。
+ * l/h 读 init_l_m / init_h_m；yc 再减 init_hub_up_m 使车心离开地面。
  */
-void VehicleTracker::initEkf(const ArmorBoard& armor) {
+void VehicleTracker::initEkf(const ArmorBoard& armor, const std::vector<ArmorBoard>& armors) {
     const Eigen::Vector3d xyz = armorXyzM(armor);
     const double yaw = armorYaw(armor);
-    const double r = params_.default_radius_m;
-    // 车心 = 板心 + r * 背法线水平分量（sin/cos 与量测圆周互逆）。
-    const double xc = xyz[0] + r * std::sin(yaw);
-    const double yc = xyz[1];
-    const double zc = xyz[2] + r * std::cos(yaw);
+    double r = params_.default_radius_m;
+    double xc = xyz[0] + r * std::sin(yaw);
+    double yc = xyz[1];
+    double zc = xyz[2] + r * std::cos(yaw);
+
+    const ArmorBoard* second = nullptr;
+    double second_d = std::numeric_limits<double>::infinity();
+    for (const auto& a : armors) {
+        if (!a.pnp_ok || &a == &armor)
+            continue;
+        if (a.number != tracked_id_ || a.type != tracked_type_)
+            continue;
+        if (a.dist_m < second_d) {
+            second_d = a.dist_m;
+            second = &a;
+        }
+    }
+    if (second) {
+        double x2 = 0.0;
+        double z2 = 0.0;
+        double r2 = 0.0;
+        if (hubFromTwoPlates(armor, *second, x2, z2, r2)) {
+            // 两块都钉在圆上：r 用交点。高度仍用最近板，避免侧板/差 PnP 把车心拉向地面。
+            xc = x2;
+            zc = z2;
+            r = r2;
+        }
+    }
+    // 相机 Y 向下：减去上抬量，整圈离开地面。不是 init_h_m（那只加在侧板上）。
+    yc -= params_.init_hub_up_m;
+
     Eigen::VectorXd x0(11);
-    x0 << xc, 0.0, yc, 0.0, zc, 0.0, yaw, 0.0, r, 0.0, 0.0;
+    x0 << xc, 0.0, yc, 0.0, zc, 0.0, yaw, 0.0, r, params_.init_l_m, params_.init_h_m;
     Eigen::VectorXd p0_diag(11);
     p0_diag << 1.0, 64.0, 1.0, 64.0, 1.0, 64.0, 0.4, 100.0, 1.0, 1.0, 1.0;
     Eigen::MatrixXd P0 = p0_diag.asDiagonal();
