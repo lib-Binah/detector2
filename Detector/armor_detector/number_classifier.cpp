@@ -2,7 +2,7 @@
  * 注释契约：禁止随意删除本文件注释；改 warp 尺寸、归一化、类别映射、数字 6 门槛或大小板矛盾规则时必须改注释。
  * 每个函数须写清作用/输入/输出；OpenCV DNN / 透视调用处也要注明。
  *
- * 数字：灯条端点透视 → 大板裁 20×28 / 小板裁宽 +30% 再缩回 20 → 可选 Otsu → 归一化 → ONNX。
+ * 数字：灯条外侧四角透视（Light::pts）→ 大板裁 20×28 / 小板裁宽 +30% 再缩回 20 → 可选 Otsu → 归一化 → ONNX。
  * 置信度：除数字 6 外须 > conf 门槛；数字 6（索引 5）须 > digit6_threshold_（默认 0.60），不跟 conf。
  * number_img 与 CNN 输入必须是同一张；改二值开关时 overlay 左上角跟着变。
  */
@@ -107,9 +107,9 @@ void NumberClassifier::extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard
         armor.number_img.release();
         const int warp_width =
             (armor.type == ArmorType::SMALL) ? small_armor_width_ : large_armor_width_;
-        // 灯条端点映到条带左右边：下、上、上、下，与 clone_detector extractNumbers 同序。
+        // 数字条带按灯条外侧透视：灯条高仍对应 55mm 条带，不用缩放后的实际板面四角。
         const cv::Point2f src[4] = {
-            armor.left_bottom, armor.left_top, armor.right_top, armor.right_bottom};
+            armor.left.pts[2], armor.left.pts[0], armor.right.pts[1], armor.right.pts[3]};
         const int top_y = (warp_height_ - light_length_) / 2 - 1;
         const int bottom_y = top_y + light_length_;
         const cv::Point2f dst[4] = {

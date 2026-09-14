@@ -3,7 +3,7 @@
  * @brief 灯条 + 装甲板配对 / 数字 CNN / PnP 的播放调试（不改灯条检测源码）
  *
  * 注释契约：禁止随意删除本文件注释；改窗口布局、HUD、进度条或快捷键时必须改注释。
- * overlay 画的 type/lr/cd/ang/dAng/num/dist/nml 必须读 ArmorBoard 的同一属性，与配对/分类/PnP
+ * overlay 画的 type/lr/cd/ang/dAng/num/dist/nml/reproj 必须读 ArmorBoard 的同一属性，与配对/分类/PnP
  * 计算方式相同；禁止显示时另算中心距、长度比或从 rvec 另推法线。灯条框仍读 Light 字段。
  * 每个函数须写清作用、输入、输出；调用处也要注明。
  *
@@ -11,12 +11,13 @@
  *   displayimg          原图+灯条框+装甲板框及可选标注；顶栏 FPS/meanGray；只留 frame 进度条
  *                       左上角贴 number_img（默认数字 ROI 的 Otsu 二值，与 CNN 输入同一张）
  *                       nml 开时画品红箭头：远离相机的法线，默认略朝下（读 ArmorBoard::normal_cam）
+ *                       reproj 开时画半透明色块：PnP 物点按 rvec/tvec 投回（ArmorBoard::reprojectQuad）
  *                       画面按 1920×1080 可用区域缩小（已扣标题栏和 1 条进度条）
  *   Frame with Armors   上半原图+框（无数字），下半灰度二值；上下拼接后约 2 倍帧高，
  *                       整体缩到不超过 1920×1080（已扣标题栏/底栏，与 displayimg 同一套上限）
  *   armor params        gray / hsv_f / color / conf：灰度阈值、HSV 占比过滤、配色、CNN 置信度
  *                       （conf 不含数字 6，数字 6 固定 60%；从大窗拆出，避免挤占画面）
- *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 板倾角 / 灯条倾角差 / 数字 / 距离 / 法线
+ *   armor overlay       0/1 进度条：type / 灯条长度比 / 归一化中心距 / 板倾角 / 灯条倾角差 / 数字 / 距离 / 法线 / 重投影色块
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。
  */
@@ -71,6 +72,7 @@ int overlay_dAng = 1;   // ArmorBoard::light_angle_diff，与配对同一字段
 int overlay_num = 1;    // classification_result（已含数字和概率，不再另画 p）
 int overlay_dist = 1;   // ArmorBoard::dist_m（PnP）
 int overlay_nml = 1;    // ArmorBoard::draw_normal，读 normal_cam（远离相机）
+int overlay_reproj = 1; // ArmorBoard::reprojectQuad：PnP 物点投回的半透明板面
 
 /**
  * 作用：只在真正播出新帧时刷新 FPS，暂停时沿用上次。
@@ -184,6 +186,50 @@ void processArmors(const Mat& raw, LightDetector& light_detector, ArmorDetector&
 }
 
 /**
+ * 作用：把每块板的 PnP 重投影四边形画成半透明色块，核对物点+位姿是否贴上灯条框。
+ * 输入：img 为 BGR；armors 为 get_armors 结果。输出：无。四角必须读 reprojectQuad，禁止另写物点。
+ */
+void drawPnpReprojectQuads(Mat& img, const std::vector<ArmorBoard>& armors) {
+    const Scalar kFill[] = {
+        Scalar(0, 220, 0),
+        Scalar(0, 140, 255),
+        Scalar(0, 255, 255),
+        Scalar(255, 0, 255),
+    };
+    constexpr double kAlpha = 0.38;
+    Mat wash = img.clone();
+    std::vector<std::vector<Point>> outlines;
+    std::vector<Scalar> colors;
+    for (size_t i = 0; i < armors.size(); ++i) {
+        const auto q = armors[i].reprojectQuad();  // rvec/tvec + 与 solvePnP 同一物点 → 像素四角
+        if (q.size() != 4)
+            continue;
+        std::vector<Point> poly;
+        poly.reserve(4);
+        bool skip = false;
+        for (const auto& p : q) {
+            if (!std::isfinite(p.x) || !std::isfinite(p.y)) {
+                skip = true;
+                break;
+            }
+            poly.emplace_back(cvRound(p.x), cvRound(p.y));
+        }
+        if (skip)
+            continue;
+        const Scalar& c = kFill[i % 4];
+        fillConvexPoly(wash, poly, c, LINE_AA);
+        outlines.push_back(std::move(poly));
+        colors.push_back(c);
+    }
+    if (outlines.empty())
+        return;
+    addWeighted(wash, kAlpha, img, 1.0 - kAlpha, 0.0, img);
+    // 轮廓 1px，与 draw_armor 灯条框同粗，错开的缝才看得清。
+    for (size_t i = 0; i < outlines.size(); ++i)
+        polylines(img, outlines[i], true, colors[i], 1, LINE_AA);
+}
+
+/**
  * 作用：按 overlay 开关在装甲板旁画 type/lr/cd/ang/dAng/num/dist，并可选画远离相机的法线。
  * 输入：img 为已画框的 BGR；armors 为 get_armors 的结果。
  * 输出：无返回值。数字必须读 ArmorBoard 字段，禁止另算中心距、长度比、灯条倾角差或法线。
@@ -276,7 +322,7 @@ void drawNumberThumbnails(Mat& img, const std::vector<ArmorBoard>& armors) {
  * 输入：无。输出：BGR 说明图，每帧 imshow，避免空窗被后端丢掉。
  */
 Mat makeOverlayLegend() {
-    Mat panel(200, 520, CV_8UC3, Scalar(28, 28, 28));
+    Mat panel(222, 520, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "0=hide  1=show   (displayimg only)", Point(8, 22),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 200, 100), kFontThick, LINE_AA);
     putText(panel, "type=SMALL/LARGE from center_distance", Point(8, 44),
@@ -291,7 +337,9 @@ Mat makeOverlayLegend() {
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "nml=magenta  away-from-cam normal (slightly down)", Point(8, 154),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(255, 0, 255), kFontThick, LINE_AA);
-    putText(panel, "H/angle=Light fields  same as matching", Point(8, 176),
+    putText(panel, "reproj=PnP object quad (rvec/tvec, same pts as solve)", Point(8, 176),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(0, 220, 0), kFontThick, LINE_AA);
+    putText(panel, "H/angle=Light fields  same as matching", Point(8, 198),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
     return panel;
 }
@@ -466,6 +514,7 @@ int main(int argc, char** argv) {
     createTrackbar("num", win_overlay, &overlay_num, 1);
     createTrackbar("dist", win_overlay, &overlay_dist, 1);
     createTrackbar("nml", win_overlay, &overlay_nml, 1);  // 0/1：品红法线箭头，读 normal_cam
+    createTrackbar("reproj", win_overlay, &overlay_reproj, 1);  // 0/1：PnP 重投影半透明板，读 reprojectQuad
 
     auto syncTrackbar = [&]() {
         scrubber.syncing = true;
@@ -533,6 +582,11 @@ int main(int argc, char** argv) {
         for (auto& light : lights) {
             light.draw_light(vis_info);
             light.draw_light(vis_plain);
+        }
+        if (overlay_reproj) {
+            // 先铺 PnP 色块，再画灯条端点框，错开的边就是重投影误差。
+            drawPnpReprojectQuads(vis_info, armors);
+            drawPnpReprojectQuads(vis_plain, armors);
         }
         for (auto& armor : armors) {
             armor.draw_armor(vis_info);

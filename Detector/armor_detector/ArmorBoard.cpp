@@ -4,9 +4,10 @@
  * 配对筛选和 overlay 必须读这些成员，禁止各自再算一遍。
  * 法线 overlay 必须读 normal_cam，禁止显示时另从 rvec 算一遍。
  * 预测板矩形必须走 projectArmorQuad（与 solvePnP 同一物点和锁俯仰 R）。
+ * armor_test 半透明色块必须走 reprojectQuad（同一物点 + 本板 rvec/tvec，与 reproj_error_px 同源）。
  * 每个函数须写清作用/输入/输出；本文件内的 OpenCV 调用处也要注明。
  *
- * 装甲板几何：左右灯条端点 → 长度比/中心距/倾角/灯条倾角差 → 画框 → IPPE 初值 + 锁俯仰搜 yaw。
+ * 装甲板几何：灯条外侧四角 → 判定大小板后高度缩放到实际板面 → 画框/PnP/重投影。
  */
 #include "ArmorBoard.h"
 #include "Detector/detector_config.h"
@@ -258,11 +259,28 @@ bool refineYawLockedPitch(const std::vector<cv::Point3f>& object_points,
 
 // 物点单位 mm。这是两灯条构成的矩形（不是外扩后的数字面）。
 // 默认与旧硬编码一致；loadPnpConfig 从 yaml 覆盖。改尺寸时 PnP 距离会一起变。
-float ArmorBoard::small_width_mm_ = 135.f;
-float ArmorBoard::small_height_mm_ = 55.f;
-float ArmorBoard::large_width_mm_ = 225.f;
-float ArmorBoard::large_height_mm_ = 55.f;
+float ArmorBoard::small_width_mm_ = 140.f;
+float ArmorBoard::small_height_mm_ = 125.f;  // 实际小板面高，不是灯条 55
+float ArmorBoard::large_width_mm_ = 235.f;
+float ArmorBoard::large_height_mm_ = 127.f;  // 实际大板面高
+float ArmorBoard::light_height_mm_ = 55.f;   // 左右灯条矩形高；像点沿左右边 ×(板高/本值)
 float ArmorBoard::armor_pitch_deg_ = 15.f;  // 板面朝斜上；锁进 R，同济方案消俯仰跳变
+
+/**
+ * 作用：实际板面物点（mm），宽高读静态尺寸。
+ * 输入：大小板。输出：左下起顺时针；高为实际板面。改顶点顺序时 solvePnP / 重投影必须一起改。
+ */
+std::vector<cv::Point3f> ArmorBoard::objectCornersMm(ArmorType type) {
+    const bool large = (type == ArmorType::LARGE);
+    const float half_x = (large ? large_width_mm_ : small_width_mm_) * 0.5f;
+    const float half_y = (large ? large_height_mm_ : small_height_mm_) * 0.5f;
+    return {
+        {-half_x, half_y, 0.f},   // 左下
+        {-half_x, -half_y, 0.f},  // 左上
+        {half_x, -half_y, 0.f},   // 右上
+        {half_x, half_y, 0.f},    // 右下
+    };
+}
 
 // 与 detector/ArmorBoard.cpp、clone_detector/tools/detect_video.py 同一份默认内参；畸变置零。
 cv::Mat ArmorBoard::camera_matrix_ = (cv::Mat_<double>(3, 3) <<
@@ -272,16 +290,14 @@ cv::Mat ArmorBoard::camera_matrix_ = (cv::Mat_<double>(3, 3) <<
 cv::Mat ArmorBoard::dist_coeffs_ = (cv::Mat_<double>(5, 1) << 0, 0, 0, 0, 0);
 
 /**
- * 作用：灯条上端点 = 左上与右上的中点。
- * 输入：读 Light::pts。输出：图像坐标。
+ * 作用：灯条上边中点。输入：读 Light::pts。输出：图像坐标。containLight 用，不是装甲四角。
  */
 cv::Point2f ArmorBoard::topOf(const Light& light) {
     return (light.pts[0] + light.pts[1]) * 0.5f;  // 左上、右上中点
 }
 
 /**
- * 作用：灯条下端点 = 左下与右下的中点。
- * 输入：读 Light::pts。输出：图像坐标。
+ * 作用：灯条下边中点。输入：读 Light::pts。输出：图像坐标。containLight 用，不是装甲四角。
  */
 cv::Point2f ArmorBoard::bottomOf(const Light& light) {
     return (light.pts[2] + light.pts[3]) * 0.5f;  // 左下、右下中点
@@ -289,7 +305,7 @@ cv::Point2f ArmorBoard::bottomOf(const Light& light) {
 
 /**
  * 作用：两灯条填几何；左右按中心 x 排序；四个配对量当场写入。
- * 输入：两根 Light。输出：left/right/端点/center/light_ratio/center_distance/angle/light_angle_diff。
+ * 输入：两根 Light。输出：left/right/灯条外侧四角/center/light_ratio/center_distance/angle/light_angle_diff。
  */
 ArmorBoard::ArmorBoard(const Light& a, const Light& b) {
     // 左灯条 = 中心更靠左的那根；后续 PnP 点序依赖这个约定。
@@ -301,10 +317,11 @@ ArmorBoard::ArmorBoard(const Light& a, const Light& b) {
         right = a;
     }
 
-    left_top = topOf(left);
-    left_bottom = bottomOf(left);
-    right_top = topOf(right);
-    right_bottom = bottomOf(right);
+    // 装甲四角先写成灯条外侧：左灯左上/左下，右灯右上/右下。isArmor 通过后再按实际板高缩放。
+    left_top = left.pts[0];
+    left_bottom = left.pts[2];
+    right_top = right.pts[1];
+    right_bottom = right.pts[3];
     center = (left.center() + right.center()) * 0.5f;
 
     // 长度比：短 / 长，必须读 Light::height（与灯条检测同源）。
@@ -330,11 +347,32 @@ ArmorBoard::ArmorBoard(const Light& a, const Light& b) {
 }
 
 /**
- * 作用：画装甲板四边形和交叉线；小板金黄，大板绿。
+ * 作用：左右边各自绕中点把高度乘以 实际板高/灯条高。宽（左右间距）不变。
+ * 输入：type 已定；四角仍是灯条外侧。输出：四角为实际板面对应的图像四边形。
+ */
+void ArmorBoard::scaleToActualArmorSize() {
+    const double light_h = static_cast<double>(light_height_mm_);
+    if (light_h < 1e-6)
+        return;
+    const double armor_h = static_cast<double>(
+        type == ArmorType::LARGE ? large_height_mm_ : small_height_mm_);
+    const float s = static_cast<float>(armor_h / light_h);
+    auto scale_edge = [s](cv::Point2f& top, cv::Point2f& bot) {
+        const cv::Point2f mid = (top + bot) * 0.5f;
+        top = mid + (top - mid) * s;
+        bot = mid + (bot - mid) * s;
+    };
+    scale_edge(left_top, left_bottom);    // 左边：灯条高 → 板高
+    scale_edge(right_top, right_bottom);  // 右边
+}
+
+/**
+ * 作用：画实际板面四边形和交叉线（缩放后的四角，与 PnP 同源）；小板金黄，大板绿。
+ * 边框 1px：和 PnP 重投影轮廓叠画时才能看出错开，2px 会糊成一条。
  * 输入：BGR 图，就地画线。输出：无返回值。
  */
 void ArmorBoard::draw_armor(cv::Mat& img) const {
-    constexpr int kThickness = 2;
+    constexpr int kThickness = 1;
     // 小板金黄、大板绿，和旧 detector 调试色一致，避免和红蓝灯条抢色。
     const cv::Scalar color = (type == ArmorType::SMALL)
                                  ? cv::Scalar(0, 215, 255)
@@ -375,16 +413,7 @@ std::vector<cv::Point2f> ArmorBoard::projectArmorQuad(const cv::Point3d& center_
                                                       ArmorType type) {
     if (center_mm.z <= 1.0)
         return {};
-    const bool large = (type == ArmorType::LARGE);
-    const float half_x = (large ? large_width_mm_ : small_width_mm_) * 0.5f;
-    const float half_y = (large ? large_height_mm_ : small_height_mm_) * 0.5f;
-    // 与 solvePnP 同一物点：左下起顺时针，Y 向下。
-    const std::vector<cv::Point3f> object_points = {
-        {-half_x, half_y, 0.f},
-        {-half_x, -half_y, 0.f},
-        {half_x, -half_y, 0.f},
-        {half_x, half_y, 0.f},
-    };
+    const std::vector<cv::Point3f> object_points = objectCornersMm(type);  // 与 solvePnP 同一物点
     const double pitch = -std::abs(static_cast<double>(armor_pitch_deg_)) * CV_PI / 180.0;
     const cv::Mat R = buildLockedR(yaw_rad, pitch);  // 与 PnP 锁俯仰同一 R
     cv::Mat tvec = (cv::Mat_<double>(3, 1) << center_mm.x, center_mm.y, center_mm.z);
@@ -398,6 +427,31 @@ std::vector<cv::Point2f> ArmorBoard::projectArmorQuad(const cv::Point3d& center_
     cv::Rodrigues(R, rvec);
     std::vector<cv::Point2f> pix;
     cv::projectPoints(object_points, rvec, tvec, camera_matrix_, dist_coeffs_, pix);
+    return pix;
+}
+
+/**
+ * 作用：rvec/tvec 把 objectCornersMm 投回像素，与 meanReprojPx 同一对应。
+ * 输入：无。输出：四角；pnp 失败或相机后方为空。
+ */
+std::vector<cv::Point2f> ArmorBoard::reprojectQuad() const {
+    if (!pnp_ok || rvec.empty() || tvec.empty())
+        return {};
+    const std::vector<cv::Point3f> object_points = objectCornersMm(type);
+    cv::Mat r64, t64;
+    rvec.convertTo(r64, CV_64F);
+    tvec.convertTo(t64, CV_64F);
+    t64 = t64.reshape(1, 3);
+    cv::Mat R;
+    cv::Rodrigues(r64, R);
+    for (const auto& op : object_points) {
+        const cv::Mat pw = (cv::Mat_<double>(3, 1) << op.x, op.y, op.z);
+        const cv::Mat pc = R * pw + t64;
+        if (pc.at<double>(2, 0) <= 1.0)
+            return {};
+    }
+    std::vector<cv::Point2f> pix;
+    cv::projectPoints(object_points, r64, t64, camera_matrix_, dist_coeffs_, pix);
     return pix;
 }
 
@@ -455,18 +509,8 @@ bool ArmorBoard::solvePnP() {
     rvec.release();
     tvec.release();
 
-    const bool large = (type == ArmorType::LARGE);
-    const float half_x = (large ? large_width_mm_ : small_width_mm_) * 0.5f;
-    const float half_y = (large ? large_height_mm_ : small_height_mm_) * 0.5f;
-
-    // 物点：左下起顺时针。Y 正方向朝板下方，与 OpenCV 图像 y 向下一致。
-    // +Z = X×Y：正面朝向相机时指向相机；画箭头时再翻成远离相机。
-    const std::vector<cv::Point3f> object_points = {
-        {-half_x, half_y, 0.f},   // 左下
-        {-half_x, -half_y, 0.f},  // 左上
-        {half_x, -half_y, 0.f},   // 右上
-        {half_x, half_y, 0.f},    // 右下
-    };
+    // 物点：实际板面 objectCornersMm。像点：缩放后的装甲四角（与画框同一套）。
+    const std::vector<cv::Point3f> object_points = objectCornersMm(type);
     const std::vector<cv::Point2f> image_points = {
         left_bottom, left_top, right_top, right_bottom};
 
@@ -570,9 +614,10 @@ bool ArmorBoard::loadPnpConfig(const std::string& path) {
 
     const cv::FileNode pnp = fs["pnp"];
     readYaml(pnp, "small_width_mm", small_width_mm_);
-    readYaml(pnp, "small_height_mm", small_height_mm_);
+    readYaml(pnp, "small_height_mm", small_height_mm_);  // 实际小板面高
     readYaml(pnp, "large_width_mm", large_width_mm_);
-    readYaml(pnp, "large_height_mm", large_height_mm_);
+    readYaml(pnp, "large_height_mm", large_height_mm_);  // 实际大板面高
+    readYaml(pnp, "light_height_mm", light_height_mm_);  // 灯条矩形高，用来算像点缩放比
     readYaml(pnp, "armor_pitch_deg", armor_pitch_deg_);
 
     const cv::FileNode cam = fs["camera"];

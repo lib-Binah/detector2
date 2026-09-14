@@ -8,7 +8,7 @@
 # ---------- 灯条：灰度分割 + 几何 ----------
 light:
   # 灰度二值下限：像素 > 该值视为灯条前景，再做闭运算。播放器 gray 进度条改的是同一项。
-  gray_thres: 115
+  gray_thres: 104
   # 闭运算椭圆核边长（像素）。只补灯芯小黑洞；太大易把两根灯粘在一起。须为奇数。
   close_ksize: 3
   # 细长比下限：Light::ratio = height/width。太胖的噪声丢掉。
@@ -97,16 +97,18 @@ number:
   # 0：送灰度。THRESH_BINARY 亮区=255。
   use_binary: 1
 
-# ---------- PnP 物点（两灯条构成的矩形，单位 mm；改了 dist_m 会变）----------
+# ---------- PnP 物点（实际板面 mm；像点由灯条矩形只缩放高度得到）----------
 pnp:
-  # 小板宽度（左右灯中心距对应的物宽）。
-  small_width_mm: 135.0
-  # 小板高度（灯条长对应的物高）。
-  small_height_mm: 55.0
-  # 大板宽度。
+  # 小板宽度（左右灯条外侧间距，与实际板宽相同）。
+  small_width_mm: 140.0
+  # 实际小板面高度。灯条矩形高见 light_height_mm，像点只把高度缩放到本值。
+  small_height_mm: 125.0
+  # 大板宽度（左右灯条外侧间距，与实际板宽相同）。
   large_width_mm: 235.0
-  # 大板高度。
-  large_height_mm: 55.0
+  # 实际大板面高度。
+  large_height_mm: 127.0
+  # 左右灯条组成的矩形高度（mm）。画框/PnP/重投影的像点 = 灯条四角沿左右边 ×(板高/本值)。
+  light_height_mm: 55.0
   # 板面朝斜上的安装角（度）。同济方案：俯仰当已知量只搜 yaw，避免 IPPE 法线上下跳。
   armor_pitch_deg: 15.0
 
@@ -134,7 +136,7 @@ aim:
   # 连续匹配这么多帧才从 detecting 进入 tracking（同济 min_detect_count）。
   min_detect_count: 3
   # 短暂丢失超过这么多帧 → lost。
-  max_temp_lost_count: 15
+  max_temp_lost_count: 10
   # 近窗 NIS 失败次数 ≥ 该比例×100 则重置（同济 0.4）。
   nis_fail_rate: 0.40
 

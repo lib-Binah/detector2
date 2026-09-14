@@ -58,12 +58,12 @@ bool ArmorDetector::loadConfig(const std::string& path) {
 }
 
 /**
- * 作用：两灯四端点包围盒里是否夹着第三根灯。
+ * 作用：两灯条上下边中点包围盒里是否夹着第三根灯。
  * 输入：一对灯、本帧全部灯。输出：true=夹了。
  */
 bool ArmorDetector::containLight(const Light& a, const Light& b,
                                  const std::vector<Light>& lights) const {
-    // 包围盒只用四端点，不用整根旋转矩形，避免把斜向邻近灯误判成“夹在中间”。
+    // 包围盒用灯条上下边中点（topOf/bottomOf），不用装甲外侧四角，避免把斜向邻近灯误判成“夹在中间”。
     const std::vector<cv::Point2f> pts = {
         ArmorBoard::topOf(a), ArmorBoard::bottomOf(a),
         ArmorBoard::topOf(b), ArmorBoard::bottomOf(b)};
@@ -86,8 +86,8 @@ bool ArmorDetector::containLight(const Light& a, const Light& b,
 }
 
 /**
- * 作用：读 ArmorBoard 已写入的四个量判是否像装甲，并写入 type。
- * 输入：构造好的 armor。输出：true 表示通过门槛。
+ * 作用：读 ArmorBoard 已写入的四个量判是否像装甲，写入 type；通过则把四角缩放到实际板高。
+ * 输入：构造好的 armor（四角仍是灯条外侧）。输出：true 表示通过门槛，且四角已是实际板面。
  */
 bool ArmorDetector::isArmor(ArmorBoard& armor) const {
     const bool ratio_ok = armor.light_ratio > params_.min_light_ratio;
@@ -106,7 +106,10 @@ bool ArmorDetector::isArmor(ArmorBoard& armor) const {
     // 分界用大板区间下限：比它大的当大板。overlay 的 type 必须读这个字段。
     armor.type = (d > params_.min_large_center_distance) ? ArmorType::LARGE : ArmorType::SMALL;
 
-    return ratio_ok && distance_ok && angle_ok && light_angle_ok;
+    const bool ok = ratio_ok && distance_ok && angle_ok && light_angle_ok;
+    if (ok)
+        armor.scaleToActualArmorSize();  // 灯条矩形高 → 实际板高；画框/PnP/重投影同源
+    return ok;
 }
 
 /**
@@ -134,7 +137,7 @@ std::vector<ArmorBoard> ArmorDetector::matchLights(const std::vector<Light>& lig
             if (containLight(a, b, lights))
                 continue;  // 四端点盒里夹了第三根灯 → 跨板错配
 
-            ArmorBoard armor(a, b);  // 两灯 → 左右排序 + 四个几何量
+            ArmorBoard armor(a, b);  // 两灯 → 左右排序 + 灯条外侧四角 + 四个几何量
             if (isArmor(armor))
                 armors.push_back(std::move(armor));
         }
@@ -194,7 +197,7 @@ std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& ligh
     if (armors.empty())
         return armors;
 
-    // 2) extractNumbers：四端点透视 → 大板 20×28 / 小板宽 +30% → 可选 Otsu，写入 number_img。
+    // 2) extractNumbers：灯条外侧四角透视（Light::pts，不是缩放后的板面）→ 大板 20×28 / 小板宽 +30%。
     classifier_.extractNumbers(frame, armors);
 
     // 3) classify：CNN softmax；other / 置信度未大于门槛（数字 6 用固定 60%）/ 大板非 1 或小板为 1 的板删掉。没模型则跳过。
