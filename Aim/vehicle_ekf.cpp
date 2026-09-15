@@ -3,6 +3,8 @@
  * 检测读 ArmorBoard::positionMm / normal_cam / dist_m / number，禁止另算 PnP。
  * 每个函数须写清作用/输入/输出；调用处注明意图。
  * 滤波流程对齐同济 Target/Tracker：单板+半径 init，每块板都更新 r，不在首帧量测。
+ * 只有 Tracking 且本帧同时看见两块同号同色板才按（数字,颜色）缓存 r/l/h；
+ * reset/seek 不丢缓存，再锁同车时直接用。单板不记，避免 r 与车心糊在一起。
  */
 #include "vehicle_ekf.h"
 
@@ -137,15 +139,18 @@ bool VehicleTracker::loadConfig(const std::string& path) {
 }
 
 /**
- * 作用：清空跟踪。输入：无。输出：Lost。
+ * 作用：清空跟踪。不丢同号同色几何缓存。
+ * 输入：无。输出：Lost。
  */
 void VehicleTracker::reset() {
     state_ = VehicleTrackState::Lost;
     ekf_ready_ = false;
     tracked_id_ = 0;
+    tracked_color_ = 0;
     detect_count_ = 0;
     temp_lost_count_ = 0;
     last_phase_id_ = 0;
+    update_count_ = 0;
 }
 
 /**
@@ -155,6 +160,24 @@ int VehicleTracker::armorCountFor(const ArmorBoard& armor) {
     if (armor.type == ArmorType::LARGE && (armor.number == 3 || armor.number == 4 || armor.number == 5))
         return 2;
     return 4;
+}
+
+/**
+ * 作用：本帧同时看到两块同号同色板、且已 Tracking 时，把 r/l/h 记到（数字,颜色）下。
+ * 单板不写：正对一块时 r 与车心深度分不清。输入：本帧该车 pnp_ok 板数。输出：满足时写入 geom_priors_。
+ */
+void VehicleTracker::maybeSaveGeomPrior(int n_visible_plates) {
+    if (state_ != VehicleTrackState::Tracking || !ekf_ready_)
+        return;
+    if (n_visible_plates < 2)
+        return;  // 必须同帧两块板才能把半径从车心里拆出来
+    if (tracked_id_ <= 0 || (tracked_color_ != 1 && tracked_color_ != 2))
+        return;
+    VehicleGeomPrior p;
+    p.r_m = ekf_.x[8];
+    p.l_m = ekf_.x[9];
+    p.h_m = ekf_.x[10];
+    geom_priors_[{tracked_id_, tracked_color_}] = p;
 }
 
 /**
@@ -185,6 +208,18 @@ void VehicleTracker::step(const std::vector<ArmorBoard>& armors, double dt) {
                                                  ekf_.recent_nis_failures.end(), 0);
             if (nis_fail >= params_.nis_fail_rate * static_cast<double>(ekf_.window_size))
                 reset();
+            else {
+                // 只数本帧这辆车：pnp_ok 且数字/类型/颜色都对上。两块才能把 r 从车心里拆开。
+                int n_visible = 0;
+                for (const auto& a : armors) {
+                    if (!a.pnp_ok)
+                        continue;
+                    if (a.number == tracked_id_ && a.type == tracked_type_ &&
+                        a.color() == tracked_color_)
+                        ++n_visible;
+                }
+                maybeSaveGeomPrior(n_visible);  // 同帧两块同号同色板才记 r/l/h
+            }
         }
     }
 }
@@ -208,30 +243,44 @@ bool VehicleTracker::setTarget(const std::vector<ArmorBoard>& armors) {
     if (!best)
         return false;
     tracked_id_ = best->number;
+    tracked_color_ = best->color();  // 与灯条 color 同源：1 红 / 2 蓝
     tracked_type_ = best->type;
     armor_num_ = armorCountFor(*best);
-    initEkf(*best);  // 单板 + yaml 半径，l=h=0；量测留给下一帧 updateTarget
+    const VehicleGeomPrior* prior = nullptr;
+    VehicleGeomPrior held;
+    if (tracked_id_ > 0 && (tracked_color_ == 1 || tracked_color_ == 2)) {
+        const auto it = geom_priors_.find({tracked_id_, tracked_color_});
+        if (it != geom_priors_.end()) {
+            held = it->second;
+            prior = &held;  // 同号同色已收敛过：r/l/h 用缓存，车心仍按本帧板推
+        }
+    }
+    initEkf(*best, prior);  // 无缓存则 yaml 半径、l=h=0；有缓存则几何几乎不再重估
     return true;
 }
 
 /**
- * 作用：写入 11 维初值（同济 Target 构造）。车心 = 板心沿背法线推 r，l=h=0。
- * P0 对角 {1,64,1,64,1,64,0.4,100,1,1,1}，与同济步兵/英雄/平衡一致。
- * 输入：用于锁车的那块板。输出：ekf_ 就绪。
+ * 作用：写入 11 维初值。车心 = 本帧板心沿背法线推 r。
+ * 无 prior：r=yaml，l=h=0，P0 的 r/l/h=1（同济步兵）。
+ * 有 prior：r/l/h 用缓存，P0 的 r/l/h 很小，避免再花一段收敛。
+ * 输入：锁车那块板；prior 可空。输出：ekf_ 就绪。
  */
-void VehicleTracker::initEkf(const ArmorBoard& armor) {
+void VehicleTracker::initEkf(const ArmorBoard& armor, const VehicleGeomPrior* prior) {
     const Eigen::Vector3d xyz = armorXyzM(armor);
     const double yaw = armorYaw(armor);
-    const double r = params_.default_radius_m;
+    const double r = prior ? prior->r_m : params_.default_radius_m;
+    const double l = prior ? prior->l_m : 0.0;
+    const double h = prior ? prior->h_m : 0.0;
+    const double p_rlh = prior ? 1e-4 : 1.0;  // 有缓存则几乎锁死几何，只估本帧位姿/速度
     // 相机系：xc=xa+r sinθ，zc=za+r cosθ，对应同济世界系 xc=xa+r cosθ、yc=ya+r sinθ。
     const double xc = xyz[0] + r * std::sin(yaw);
     const double yc = xyz[1];
     const double zc = xyz[2] + r * std::cos(yaw);
 
     Eigen::VectorXd x0(11);
-    x0 << xc, 0.0, yc, 0.0, zc, 0.0, yaw, 0.0, r, 0.0, 0.0;
+    x0 << xc, 0.0, yc, 0.0, zc, 0.0, yaw, 0.0, r, l, h;
     Eigen::VectorXd p0_diag(11);
-    p0_diag << 1.0, 64.0, 1.0, 64.0, 1.0, 64.0, 0.4, 100.0, 1.0, 1.0, 1.0;
+    p0_diag << 1.0, 64.0, 1.0, 64.0, 1.0, 64.0, 0.4, 100.0, p_rlh, p_rlh, p_rlh;
     Eigen::MatrixXd P0 = p0_diag.asDiagonal();
     auto x_add = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
         Eigen::VectorXd c = a + b;
@@ -241,6 +290,7 @@ void VehicleTracker::initEkf(const ArmorBoard& armor) {
     ekf_ = ExtendedKalmanFilter(x0, P0, x_add);
     ekf_ready_ = true;
     last_phase_id_ = 0;
+    update_count_ = 0;
 }
 
 /**
@@ -352,6 +402,7 @@ void VehicleTracker::updateYpda(const ArmorBoard& armor, int id) {
     Eigen::VectorXd z(4);
     z << ypd[0], ypd[1], ypd[2], yaw;
     ekf_.update(z, H, R, h, z_sub);  // ypd+装甲 yaw → 后验整车状态
+    ++update_count_;
 }
 
 /**

@@ -5,8 +5,8 @@
 #include "ekf.h"
 
 #include <Eigen/Dense>
-#include <string>
-#include <vector>
+#include <map>
+#include <utility>
 
 /**
  * 注释契约：本文件说明同济整车状态为什么是 11 维、量测为什么是 ypd+装甲 yaw。
@@ -25,6 +25,8 @@
  * 四装甲 id=1/3 用 r+l 和 yc+h。量测 z = (LOS yaw, pitch, 距离, 装甲 yaw)，H = H_ypd · H_xyza。
  * 同济每块可见板都做 ypda 更新，不冻 r；l/h 只在 id=1/3 的雅可比里非零。
  * 锁车只按最近一块板 + 给定半径 init，l=h=0，P0 的 r/l/h 为 1；量测从下一帧开始。
+ * 跟踪进入 Tracking 且本帧同时看见两块同号同色板时，按（数字, 颜色）缓存 r/l/h；
+ * 再锁同号同色车时用缓存当几何初值，P0 的 r/l/h 很小。单板不记，避免 r 与车心糊在一起。
  */
 struct VehicleEkfParams {
     // 同济步兵/英雄/平衡：沿板背法线推车心的 r 初值（米）。yaml aim.default_radius_m，默认 0.2。
@@ -35,6 +37,15 @@ struct VehicleEkfParams {
     int min_detect_count = 3;        // 连续匹配这么多帧才从 detecting → tracking
     int max_temp_lost_count = 15;    // 短暂丢失超过这么多帧 → lost
     double nis_fail_rate = 0.40;     // 窗内 NIS 失败次数 ≥ 该比例×window_size 则重置（同济 0.4×100）
+};
+
+/**
+ * 同号同色车在双板可见时记下的整车几何（与位姿无关）。再锁这辆车时当 r/l/h 初值。
+ */
+struct VehicleGeomPrior {
+    double r_m = 0.20;
+    double l_m = 0.0;
+    double h_m = 0.0;
 };
 
 enum class VehicleTrackState {
@@ -72,7 +83,7 @@ public:
     const ExtendedKalmanFilter& ekf() const { return ekf_; }
 
     /**
-     * 作用：丢掉当前车，下一帧重新选最近车辆。
+     * 作用：丢掉当前车，下一帧重新选最近车辆。不清除同号同色几何缓存。
      * 输入：无。输出：state=Lost。
      */
     void reset();
@@ -113,11 +124,21 @@ private:
     int detect_count_ = 0;
     int temp_lost_count_ = 0;
     int last_phase_id_ = 0;
+    int tracked_color_ = 0;  // 1 红 / 2 蓝；与 ArmorBoard::color 同源
+    int update_count_ = 0;   // 本段跟踪的 ypda 次数
+    // 键：(number, color)。reset / seek 不丢，同号同色再锁车时复用 r/l/h。
+    std::map<std::pair<int, int>, VehicleGeomPrior> geom_priors_;
 
     bool setTarget(const std::vector<ArmorBoard>& armors);
     bool updateTarget(const std::vector<ArmorBoard>& armors, double dt);
     void stateMachine(bool found);
-    void initEkf(const ArmorBoard& armor);
+    void initEkf(const ArmorBoard& armor, const VehicleGeomPrior* prior);
+    /**
+     * 作用：双板可见时把当前 r/l/h 写入 geom_priors_。
+     * 输入：n_visible_plates 为本帧该车 pnp_ok 且同号同色同类型的板数。
+     * 输出：≥2 且 Tracking 时覆盖该（数字,颜色）缓存；否则不写。
+     */
+    void maybeSaveGeomPrior(int n_visible_plates);
     void updateYpda(const ArmorBoard& armor, int phase_id);
     Eigen::Vector3d armorXyz(const Eigen::VectorXd& x, int id) const;
     Eigen::MatrixXd hJacobian(const Eigen::VectorXd& x, int id) const;

@@ -1,6 +1,8 @@
 /**
  * 注释契约：禁止删本文件注释；改选板规则、飞时迭代或绘制颜色时必须改注释。
  * 瞄准点：飞时内外推车心（kv·v）与当前板相位（kw·ω），再重力抬高；禁止改成飞时后重选正对板。
+ * 车心连线连的是本帧最正对的预测板（facing_id），不是飞时相位 phase_id。
+ * ω 箭头：正对板心，v=ω×(板心−车心)，ω 与车心旁文字同一 vyaw。
  * 每个函数须写清作用/输入/输出；调用处注明意图。
  */
 #include "aimer.h"
@@ -58,6 +60,26 @@ double facingErr(const Eigen::Vector4d& p) {
 }
 
 /**
+ * 作用：在预测板里挑相对相机最正对的一块（板 yaw 与视线 yaw 差最小）。
+ * 输入：armorXyza 的 n 块 (x,y,z,yaw)。输出：下标；空列表为 0。
+ */
+int pickFacingPlate(const std::vector<Eigen::Vector4d>& xyza) {
+    const int n = static_cast<int>(xyza.size());
+    if (n <= 0)
+        return 0;
+    int best = 0;
+    double best_err = facingErr(xyza[0]);
+    for (int i = 1; i < n; ++i) {
+        const double e = facingErr(xyza[static_cast<std::size_t>(i)]);
+        if (e < best_err) {
+            best_err = e;
+            best = i;
+        }
+    }
+    return best;
+}
+
+/**
  * 作用：锁定当前相位做 v、ω 超前；转出可打锥面则沿自旋方向切到下一块。
  * 原理：不在飞时后重选「正对相机」的板，否则小陀螺时瞄准点会钉在车头。
  * 输入：飞时后的 n 块板；phase 为本帧匹配相位；vyaw 为飞时用的自旋（已乘 kw，rad/s）。
@@ -85,6 +107,24 @@ int pickLeadPlate(const std::vector<Eigen::Vector4d>& xyza, int phase, double vy
  */
 cv::Point3d xyzaToMm(const Eigen::Vector4d& p) {
     return {p[0] * 1000.0, p[1] * 1000.0, p[2] * 1000.0};
+}
+
+/**
+ * 作用：正对板心处 ω 切向箭头的尖端像素。v=ω×(板心−车心)，ω 绕相机 Y（竖直向下）。
+ * 箭头长度 = |v|×0.2s，所以 |ω| 越大越长；方向是自旋让这块板移动的方向。
+ * 输入：车心 mm；板心米；vyaw 为 EKF 角速度 rad/s。输出：尖端；|ω|过小或在相机后为 (-1,-1)。
+ */
+cv::Point2f omegaArrowTipPx(const cv::Point3d& hub_mm, const Eigen::Vector3d& plate_m, double vyaw) {
+    constexpr double kMinAbsOmega = 0.05;  // 小于约 3°/s 视为没转，避免噪声抖箭头
+    if (std::abs(vyaw) < kMinAbsOmega)
+        return {-1.f, -1.f};
+    const Eigen::Vector3d hub(hub_mm.x / 1000.0, hub_mm.y / 1000.0, hub_mm.z / 1000.0);
+    const Eigen::Vector3d r = plate_m - hub;
+    // 右手系：ω=(0, vyaw, 0)。正 ω 时前板（r≈(0,0,-R)）切向朝 −X（图像左）。
+    const Eigen::Vector3d v = Eigen::Vector3d(0.0, vyaw, 0.0).cross(r);
+    constexpr double kShowS = 0.20;
+    const Eigen::Vector3d tip = plate_m + v * kShowS;
+    return projectCamMm({tip[0] * 1000.0, tip[1] * 1000.0, tip[2] * 1000.0});
 }
 
 const char* stateName(VehicleTrackState s) {
@@ -151,6 +191,13 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
         // 板心+yaw → 与 PnP 同尺寸四角，贴在车四周。
         tgt.plate_quads.push_back(ArmorBoard::projectArmorQuad(mm, p[3], plate_type));
     }
+    tgt.facing_id = pickFacingPlate(plates_now);  // 本帧最正对相机的预测板，给车心连线
+    {
+        const int fid = tgt.facing_id;
+        if (fid >= 0 && fid < static_cast<int>(plates_now.size()))
+            tgt.omega_tip_px = omegaArrowTipPx(
+                tgt.hub_mm, plates_now[static_cast<std::size_t>(fid)].head<3>(), tgt.vyaw_rad_s);
+    }
 
     int phase = tgt.phase_id;
     cv::Point3d shot = xyzaToMm(plates_now[static_cast<std::size_t>(
@@ -192,6 +239,8 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
 /**
  * 作用：青圈车心、四周预测板色块、橙十字弹道点、车心速度文字；读 AimTarget，不另算 v/ω。
  * 板矩形读 plate_quads（与 PnP 同物点）；k 画在 v/ω 旁，与飞时系数同一字段。
+ * hub 开时画车心→plate_px[facing_id]（本帧正对板板心），以及该板心→omega_tip_px 的 ω 切向箭头。
+ * 连线/箭头读 AimTarget 已有像素与 vyaw，不另算圆周或角速度。
  * 输入：BGR 图、update 结果、开关。输出：无。
  */
 void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) const {
@@ -262,13 +311,27 @@ void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) 
             if (skip)
                 continue;
             const cv::Scalar& c = kFill[i % 4];
-            const bool aimed = tgt.ok && static_cast<int>(i) == tgt.phase_id;
-            cv::polylines(img, poly, true, c, aimed ? 3 : 2, cv::LINE_AA);
+            // 1px：和检测金框、PnP 重投影同粗，才能看出预测板是否贴上。
+            cv::polylines(img, poly, true, c, 1, cv::LINE_AA);
         }
     } else if (flags.plates) {
         for (const auto& px : tgt.plate_px) {
             if (px.x >= 0.f)
                 cv::circle(img, px, 7, cv::Scalar(0, 220, 0), 1, cv::LINE_AA);
+        }
+    }
+    if (flags.hub && tgt.hub_px.x >= 0.f) {
+        const int fid = tgt.facing_id;
+        if (fid >= 0 && fid < static_cast<int>(tgt.plate_px.size()) &&
+            tgt.plate_px[static_cast<std::size_t>(fid)].x >= 0.f) {
+            // 车心 → 本帧最正对板板心；下标读 facing_id，像素读 plate_px，不另算圆周。
+            cv::line(img, tgt.hub_px, tgt.plate_px[static_cast<std::size_t>(fid)],
+                     cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+            if (tgt.omega_tip_px.x >= 0.f) {
+                // 正对板心 → ω 切向；起终点读 plate_px / omega_tip_px，ω 已在 update 里用同一 vyaw。
+                cv::arrowedLine(img, tgt.plate_px[static_cast<std::size_t>(fid)], tgt.omega_tip_px,
+                                cv::Scalar(255, 255, 0), 2, cv::LINE_AA, 0, 0.25);
+            }
         }
     }
     if (flags.aim && tgt.ok && tgt.aim_px.x >= 0.f) {

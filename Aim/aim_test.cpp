@@ -10,7 +10,9 @@
  *   displayimg   原图 + 可选灯条/装甲/距离/法线/车心/速度/预测板/预瞄；顶栏 FPS；只留 frame 进度条
  *   aim vis      0/1 进度条：light / armor / dist / nml / hub / vel / plates / aim / hud / txt
  *                       nml 默认关；dist 读 ArmorBoard::dist_m；vel 读 EKF 车心 v 与 ω
- *                       plates 为预测板色块（与 PnP 同尺寸）；txt=0 时不画画面上的字
+ *                       plates 为预测板色块（与 PnP 同尺寸）；hub 开时青线连车心到正对预测板，
+ *                       并在该板心画 ω 切向箭头（读 EKF vyaw）
+ *                       txt=0 时不画画面上的字
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。Seek 会重置 EKF。
  */
@@ -53,12 +55,12 @@ int overlay_light = 1;   // Light::draw_light
 int overlay_armor = 1;   // ArmorBoard::draw_armor
 int overlay_dist = 1;    // ArmorBoard::dist_m（与 PnP 同一距离）
 int overlay_nml = 0;     // ArmorBoard::draw_normal，默认关
-int overlay_hub = 1;     // EKF 车心
+int overlay_hub = 1;     // EKF 车心青圈 + 连到正对预测板 + 该板心 ω 切向箭头
 int overlay_vel = 1;     // 车心线速度 |v|、角速度 ω，读 AimTarget 的 EKF 速度
 int overlay_plates = 1;  // EKF 预测板面色块（与 PnP 同尺寸四角）
 int overlay_aim = 1;     // 弹道预瞄十字（v、ω 飞时超前 + 重力）
 int overlay_hud = 1;     // 状态文字：id / tracking / 飞时
-int overlay_txt = 0;     // 总开关：0 不画画面文字（dist/vel/hud），几何 overlay 不受影响
+int overlay_txt = 1;     // 总开关：0 不画画面文字（dist/vel/hud），几何 overlay 不受影响
 
 /**
  * 作用：只在播出新帧时刷新 FPS。
@@ -185,7 +187,7 @@ Mat makeVisLegend() {
             0.42, Scalar(0, 255, 255), kFontThick, LINE_AA);
     putText(panel, "nml=magenta  locked-pitch away normal (off)", Point(8, 88), FONT_HERSHEY_SIMPLEX,
             0.42, Scalar(255, 0, 255), kFontThick, LINE_AA);
-    putText(panel, "hub=cyan  EKF rotation center", Point(8, 110), FONT_HERSHEY_SIMPLEX, 0.42,
+    putText(panel, "hub=cyan  center, line, omega arrow on facing plate", Point(8, 110), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(255, 255, 0), kFontThick, LINE_AA);
     putText(panel, "vel=hub v m/s and w rad/s  (EKF vx,vy,vz,vyaw)", Point(8, 132),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(255, 255, 0), kFontThick, LINE_AA);
@@ -397,7 +399,7 @@ int main(int argc, char** argv) {
             for (const auto& armor : armors)
                 armor.draw_normal(vis);  // 读 normal_cam
         }
-        // txt=0 时 vel/hud 的 putText 关掉，hub/plates/aim 几何仍按各自开关画
+        // txt=0 时 vel/hud 的 putText 关掉，hub（连线+ω箭头）/plates/aim 几何仍按各自开关画
         const AimDrawFlags flags{overlay_hub != 0, overlay_plates != 0, overlay_aim != 0,
                                  overlay_hud != 0 && overlay_txt != 0,
                                  overlay_vel != 0 && overlay_txt != 0};
