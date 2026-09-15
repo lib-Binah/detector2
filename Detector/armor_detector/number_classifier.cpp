@@ -107,7 +107,7 @@ void NumberClassifier::extractNumbers(const cv::Mat& bgr, std::vector<ArmorBoard
         armor.number_img.release();
         const int warp_width =
             (armor.type == ArmorType::SMALL) ? small_armor_width_ : large_armor_width_;
-        // 数字条带按灯条外侧透视：灯条高仍对应 55mm 条带，不用缩放后的实际板面四角。
+        // 数字条带按灯条外侧透视：灯条高仍对应 55mm 条带，不用 PnP 的长轴端点。
         const cv::Point2f src[4] = {
             armor.left.pts[2], armor.left.pts[0], armor.right.pts[1], armor.right.pts[3]};
         const int top_y = (warp_height_ - light_length_) / 2 - 1;

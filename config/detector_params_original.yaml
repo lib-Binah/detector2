@@ -99,15 +99,15 @@ number:
 
 # ---------- PnP 物点 mm ----------
 pnp:
-  # 小板宽（左右灯条外侧间距）。
+  # 小板宽：左右灯心距。
   small_width_mm: 140.0
-  # 实际小板面高。
+  # 实际小板面高；只给法线箭头，不进 PnP。
   small_height_mm: 125.0
-  # 大板宽。
+  # 大板宽：左右灯心距。
   large_width_mm: 235.0
-  # 实际大板面高。
+  # 实际大板面高；只给法线箭头，不进 PnP。
   large_height_mm: 127.0
-  # 灯条矩形高；像点高度按 板高/本值 缩放。
+  # 灯条长；PnP 物高，像点用每根灯的 top/bottom。
   light_height_mm: 55.0
   # 板面朝斜上的安装角（度）。同济锁俯仰搜 yaw。
   armor_pitch_deg: 15.0

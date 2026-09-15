@@ -16,7 +16,7 @@
  *   中心连线倾角 < max_angle；
  *   |Light::angle 左 - Light::angle 右| 不大于 max_light_angle_diff（配置默认 10°）。
  * 过关后透视数字、CNN 分类。一根灯条最多属于一块板：按 confidence 从高到低贪心占灯，
- * 共用灯条时留下模型置信度更高的那块。最后 IPPE 初值 + 锁俯仰搜 yaw（写入 rvec/tvec/normal_cam）。
+ * 共用灯条时留下模型置信度更高的那块。最后灯心连线+长轴四端点做 IPPE，再锁俯仰搜 yaw。
  */
 #include "armor_detector.h"
 #include "Detector/detector_config.h"
@@ -86,8 +86,8 @@ bool ArmorDetector::containLight(const Light& a, const Light& b,
 }
 
 /**
- * 作用：读 ArmorBoard 已写入的四个量判是否像装甲，写入 type；通过则把四角缩放到实际板高。
- * 输入：构造好的 armor（四角仍是灯条外侧）。输出：true 表示通过门槛，且四角已是实际板面。
+ * 作用：读 ArmorBoard 已写入的四个量判是否像装甲，写入 type。
+ * 输入：构造好的 armor（四角已是灯条长轴端点）。输出：true 表示通过门槛。
  */
 bool ArmorDetector::isArmor(ArmorBoard& armor) const {
     const bool ratio_ok = armor.light_ratio > params_.min_light_ratio;
@@ -107,8 +107,6 @@ bool ArmorDetector::isArmor(ArmorBoard& armor) const {
     armor.type = (d > params_.min_large_center_distance) ? ArmorType::LARGE : ArmorType::SMALL;
 
     const bool ok = ratio_ok && distance_ok && angle_ok && light_angle_ok;
-    if (ok)
-        armor.scaleToActualArmorSize();  // 灯条矩形高 → 实际板高；画框/PnP/重投影同源
     return ok;
 }
 
@@ -137,7 +135,7 @@ std::vector<ArmorBoard> ArmorDetector::matchLights(const std::vector<Light>& lig
             if (containLight(a, b, lights))
                 continue;  // 四端点盒里夹了第三根灯 → 跨板错配
 
-            ArmorBoard armor(a, b);  // 两灯 → 左右排序 + 灯条外侧四角 + 四个几何量
+            ArmorBoard armor(a, b);  // 两灯 → 左右排序 + 长轴四端点 + 四个几何量
             if (isArmor(armor))
                 armors.push_back(std::move(armor));
         }
@@ -197,7 +195,7 @@ std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& ligh
     if (armors.empty())
         return armors;
 
-    // 2) extractNumbers：灯条外侧四角透视（Light::pts，不是缩放后的板面）→ 大板 20×28 / 小板宽 +30%。
+    // 2) extractNumbers：灯条外侧四角透视（Light::pts，不是 PnP 的长轴端点）→ 大板 20×28 / 小板宽 +30%。
     classifier_.extractNumbers(frame, armors);
 
     // 3) classify：CNN softmax；other / 置信度未大于门槛（数字 6 用固定 60%）/ 大板非 1 或小板为 1 的板删掉。没模型则跳过。
@@ -207,7 +205,7 @@ std::vector<ArmorBoard> ArmorDetector::get_armors(const std::vector<Light>& ligh
     // 4) 贪心消共用灯：按 ArmorBoard::confidence 高→低占灯，一根灯条只留一块板。
     greedyResolveSharedLights(armors);
 
-    // 5) solvePnP：IPPE 初值后锁安装俯仰只搜 yaw；失败只把 pnp_ok=false，几何板仍留下给 overlay。
+    // 5) solvePnP：长轴四端点 IPPE，再锁俯仰并用四端点+两灯心搜 yaw；失败只把 pnp_ok=false。
     for (auto& armor : armors)
         armor.solvePnP();
 

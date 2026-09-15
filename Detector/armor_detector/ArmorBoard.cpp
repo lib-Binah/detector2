@@ -7,7 +7,7 @@
  * armor_test 半透明色块必须走 reprojectQuad（同一物点 + 本板 rvec/tvec，与 reproj_error_px 同源）。
  * 每个函数须写清作用/输入/输出；本文件内的 OpenCV 调用处也要注明。
  *
- * 装甲板几何：灯条外侧四角 → 判定大小板后高度缩放到实际板面 → 画框/PnP/重投影。
+ * 装甲板几何：灯心连线定宽 + 两灯长轴定高 → 四端点 IPPE → 四端点+两灯心锁俯仰搜 yaw。
  */
 #include "ArmorBoard.h"
 #include "Detector/detector_config.h"
@@ -110,7 +110,7 @@ cv::Mat buildLockedR(double yaw, double pitch) {
 
 /**
  * 作用：固定 R，用无畸变像素射线最小二乘求 t（物点与 t 同一单位，这里是 mm）。
- * 输入：R 为 3×3；object/image 为四对点；K/D 与 PnP 相同；t_mm 为初值并写回。
+ * 输入：R 为 3×3；object/image 为成对点（四端点，或再加两个灯心）；K/D 与 PnP 相同；t_mm 为初值并写回。
  * 输出：true 表示 t 有限且深度在 [50,20000] mm。
  */
 bool optimizeTranslationMm(const cv::Mat& R,
@@ -119,11 +119,14 @@ bool optimizeTranslationMm(const cv::Mat& R,
                            const cv::Mat& K,
                            const cv::Mat& D,
                            cv::Mat& t_mm) {
+    const int n = static_cast<int>(object_points.size());
+    if (n < 2 || image_points.size() != object_points.size())
+        return false;
     std::vector<cv::Point2f> undistorted;
     cv::undistortPoints(image_points, undistorted, K, D);  // 像素 → 归一化平面
-    cv::Mat A(8, 3, CV_64F);
-    cv::Mat b(8, 1, CV_64F);
-    for (int i = 0; i < 4; ++i) {
+    cv::Mat A(2 * n, 3, CV_64F);
+    cv::Mat b(2 * n, 1, CV_64F);
+    for (int i = 0; i < n; ++i) {
         const cv::Mat pw = (cv::Mat_<double>(3, 1) << object_points[i].x, object_points[i].y,
                             object_points[i].z);
         const cv::Mat RP = R * pw;
@@ -152,8 +155,8 @@ bool optimizeTranslationMm(const cv::Mat& R,
 }
 
 /**
- * 作用：锁俯仰后的 yaw 代价：四点位置 Huber + 边方向 Huber。
- * 输入：R/t、物点/像点、K/D。输出：越小越贴图像。
+ * 作用：锁俯仰后的 yaw 代价：各点位置 Huber + 四边形边方向 Huber；第 5、6 点是灯心，权重大。
+ * 输入：R/t、物点/像点（至少四端点）、K/D。输出：越小越贴图像。
  */
 double yawReprojCost(const cv::Mat& R,
                      const cv::Mat& t_mm,
@@ -161,17 +164,27 @@ double yawReprojCost(const cv::Mat& R,
                      const std::vector<cv::Point2f>& image_points,
                      const cv::Mat& K,
                      const cv::Mat& D) {
+    const int n = static_cast<int>(image_points.size());
+    if (n < 4 || static_cast<int>(object_points.size()) != n)
+        return std::numeric_limits<double>::infinity();
     cv::Mat rvec;
     cv::Rodrigues(R, rvec);
     std::vector<cv::Point2f> projected;
     cv::projectPoints(object_points, rvec, t_mm, K, D, projected);
+    if (static_cast<int>(projected.size()) != n)
+        return std::numeric_limits<double>::infinity();
     double cost = 0.0;
     constexpr double kHuberPx = 5.0;
     constexpr double kHuberDeg = 10.0;
     constexpr double kShapeW = 0.3;
-    for (int i = 0; i < 4; ++i) {
+    constexpr double kCenterW = 2.0;       // 灯心比长轴端点稳，位置项加倍
+    constexpr double kCenterShapeW = 0.5;  // 灯心连线方向，专压 yaw
+    for (int i = 0; i < n; ++i) {
         const double pos = cv::norm(image_points[i] - projected[i]);
-        cost += huberLoss(pos, kHuberPx);
+        const double w = (i >= 4) ? kCenterW : 1.0;
+        cost += w * huberLoss(pos, kHuberPx);
+    }
+    for (int i = 0; i < 4; ++i) {
         const int j = (i + 1) % 4;
         const cv::Point2f vo = image_points[j] - image_points[i];
         const cv::Point2f vp = projected[j] - projected[i];
@@ -183,12 +196,23 @@ double yawReprojCost(const cv::Mat& R,
         const double ang_deg = std::acos(c) * 180.0 / CV_PI;
         cost += kShapeW * huberLoss(ang_deg, kHuberDeg);
     }
+    if (n >= 6) {
+        const cv::Point2f vo = image_points[5] - image_points[4];
+        const cv::Point2f vp = projected[5] - projected[4];
+        const double n1 = cv::norm(vo);
+        const double n2 = cv::norm(vp);
+        if (n1 > 1e-6 && n2 > 1e-6) {
+            const double c = std::clamp((vo.x * vp.x + vo.y * vp.y) / (n1 * n2), -1.0, 1.0);
+            const double ang_deg = std::acos(c) * 180.0 / CV_PI;
+            cost += kCenterShapeW * huberLoss(ang_deg, kHuberDeg);
+        }
+    }
     return cost;
 }
 
 /**
  * 作用：同济锁俯仰搜 yaw。IPPE 只提供 yaw/t 初值，俯仰被安装角钉死。
- * 输入：四对点、K/D、安装角（板面朝斜上，度）、rvec/tvec 初值并写回。
+ * 输入：成对点（四端点，或再加两个灯心）、K/D、安装角（板面朝斜上，度）、rvec/tvec 初值并写回。
  * 输出：true 表示搜到合法 t；失败时不改 rvec/tvec。
  */
 bool refineYawLockedPitch(const std::vector<cv::Point3f>& object_points,
@@ -257,23 +281,23 @@ bool refineYawLockedPitch(const std::vector<cv::Point3f>& object_points,
 
 }  // namespace
 
-// 物点单位 mm。这是两灯条构成的矩形（不是外扩后的数字面）。
-// 默认与旧硬编码一致；loadPnpConfig 从 yaml 覆盖。改尺寸时 PnP 距离会一起变。
+// 物点单位 mm。宽=灯心距，高=灯条长（与 topOf/bottomOf 对应），不是塑料板面。
+// 默认与旧硬编码一致；loadPnpConfig 从 yaml 覆盖。改宽度时 PnP 距离会一起变。
 float ArmorBoard::small_width_mm_ = 140.f;
-float ArmorBoard::small_height_mm_ = 125.f;  // 实际小板面高，不是灯条 55
+float ArmorBoard::small_height_mm_ = 125.f;  // 实际小板面高；只给法线箭头，不进 PnP
 float ArmorBoard::large_width_mm_ = 235.f;
-float ArmorBoard::large_height_mm_ = 127.f;  // 实际大板面高
-float ArmorBoard::light_height_mm_ = 55.f;   // 左右灯条矩形高；像点沿左右边 ×(板高/本值)
+float ArmorBoard::large_height_mm_ = 127.f;  // 实际大板面高；只给法线箭头
+float ArmorBoard::light_height_mm_ = 55.f;   // 灯条长；PnP 物高
 float ArmorBoard::armor_pitch_deg_ = 15.f;  // 板面朝斜上；锁进 R，同济方案消俯仰跳变
 
 /**
- * 作用：实际板面物点（mm），宽高读静态尺寸。
- * 输入：大小板。输出：左下起顺时针；高为实际板面。改顶点顺序时 solvePnP / 重投影必须一起改。
+ * 作用：PnP 物点（mm），宽读大小板灯心距，高读灯条长。
+ * 输入：大小板。输出：左下起顺时针。改顶点顺序时 solvePnP / 重投影必须一起改。
  */
 std::vector<cv::Point3f> ArmorBoard::objectCornersMm(ArmorType type) {
     const bool large = (type == ArmorType::LARGE);
     const float half_x = (large ? large_width_mm_ : small_width_mm_) * 0.5f;
-    const float half_y = (large ? large_height_mm_ : small_height_mm_) * 0.5f;
+    const float half_y = light_height_mm_ * 0.5f;
     return {
         {-half_x, half_y, 0.f},   // 左下
         {-half_x, -half_y, 0.f},  // 左上
@@ -290,14 +314,14 @@ cv::Mat ArmorBoard::camera_matrix_ = (cv::Mat_<double>(3, 3) <<
 cv::Mat ArmorBoard::dist_coeffs_ = (cv::Mat_<double>(5, 1) << 0, 0, 0, 0, 0);
 
 /**
- * 作用：灯条上边中点。输入：读 Light::pts。输出：图像坐标。containLight 用，不是装甲四角。
+ * 作用：灯条上边中点。输入：读 Light::pts。输出：图像坐标。containLight 与 PnP 上端点同源。
  */
 cv::Point2f ArmorBoard::topOf(const Light& light) {
     return (light.pts[0] + light.pts[1]) * 0.5f;  // 左上、右上中点
 }
 
 /**
- * 作用：灯条下边中点。输入：读 Light::pts。输出：图像坐标。containLight 用，不是装甲四角。
+ * 作用：灯条下边中点。输入：读 Light::pts。输出：图像坐标。containLight 与 PnP 下端点同源。
  */
 cv::Point2f ArmorBoard::bottomOf(const Light& light) {
     return (light.pts[2] + light.pts[3]) * 0.5f;  // 左下、右下中点
@@ -305,7 +329,7 @@ cv::Point2f ArmorBoard::bottomOf(const Light& light) {
 
 /**
  * 作用：两灯条填几何；左右按中心 x 排序；四个配对量当场写入。
- * 输入：两根 Light。输出：left/right/灯条外侧四角/center/light_ratio/center_distance/angle/light_angle_diff。
+ * 输入：两根 Light。输出：left/right/长轴四端点/center/light_ratio/center_distance/angle/light_angle_diff。
  */
 ArmorBoard::ArmorBoard(const Light& a, const Light& b) {
     // 左灯条 = 中心更靠左的那根；后续 PnP 点序依赖这个约定。
@@ -317,11 +341,11 @@ ArmorBoard::ArmorBoard(const Light& a, const Light& b) {
         right = a;
     }
 
-    // 装甲四角先写成灯条外侧：左灯左上/左下，右灯右上/右下。isArmor 通过后再按实际板高缩放。
-    left_top = left.pts[0];
-    left_bottom = left.pts[2];
-    right_top = right.pts[1];
-    right_bottom = right.pts[3];
+    // 像点：每根灯的长轴端点（短边中点）。左右边中点即灯心，连线长度对应物宽。
+    left_top = topOf(left);
+    left_bottom = bottomOf(left);
+    right_top = topOf(right);
+    right_bottom = bottomOf(right);
     center = (left.center() + right.center()) * 0.5f;
 
     // 长度比：短 / 长，必须读 Light::height（与灯条检测同源）。
@@ -347,27 +371,7 @@ ArmorBoard::ArmorBoard(const Light& a, const Light& b) {
 }
 
 /**
- * 作用：左右边各自绕中点把高度乘以 实际板高/灯条高。宽（左右间距）不变。
- * 输入：type 已定；四角仍是灯条外侧。输出：四角为实际板面对应的图像四边形。
- */
-void ArmorBoard::scaleToActualArmorSize() {
-    const double light_h = static_cast<double>(light_height_mm_);
-    if (light_h < 1e-6)
-        return;
-    const double armor_h = static_cast<double>(
-        type == ArmorType::LARGE ? large_height_mm_ : small_height_mm_);
-    const float s = static_cast<float>(armor_h / light_h);
-    auto scale_edge = [s](cv::Point2f& top, cv::Point2f& bot) {
-        const cv::Point2f mid = (top + bot) * 0.5f;
-        top = mid + (top - mid) * s;
-        bot = mid + (bot - mid) * s;
-    };
-    scale_edge(left_top, left_bottom);    // 左边：灯条高 → 板高
-    scale_edge(right_top, right_bottom);  // 右边
-}
-
-/**
- * 作用：画实际板面四边形和交叉线（缩放后的四角，与 PnP 同源）；小板金黄，大板绿。
+ * 作用：画灯条长轴四边形和交叉线（与 PnP 像点同源）；小板金黄，大板绿。
  * 边框 1px：和 PnP 重投影轮廓叠画时才能看出错开，2px 会糊成一条。
  * 输入：BGR 图，就地画线。输出：无返回值。
  */
@@ -413,7 +417,7 @@ std::vector<cv::Point2f> ArmorBoard::projectArmorQuad(const cv::Point3d& center_
                                                       ArmorType type) {
     if (center_mm.z <= 1.0)
         return {};
-    const std::vector<cv::Point3f> object_points = objectCornersMm(type);  // 与 solvePnP 同一物点
+    const std::vector<cv::Point3f> object_points = objectCornersMm(type);  // 与 solvePnP 同一灯条矩形
     const double pitch = -std::abs(static_cast<double>(armor_pitch_deg_)) * CV_PI / 180.0;
     const cv::Mat R = buildLockedR(yaw_rad, pitch);  // 与 PnP 锁俯仰同一 R
     cv::Mat tvec = (cv::Mat_<double>(3, 1) << center_mm.x, center_mm.y, center_mm.z);
@@ -467,7 +471,7 @@ void ArmorBoard::draw_normal(cv::Mat& img) const {
     tvec.convertTo(t64, CV_64F);
     t64 = t64.reshape(1, 3);
     const cv::Point3d origin(t64.at<double>(0, 0), t64.at<double>(1, 0), t64.at<double>(2, 0));
-    // 箭头加长：5 倍板高，远距离再用深度的 18%，否则俯仰几乎看不出来。
+    // 箭头加长：5 倍实际板高（比灯条 55 更看得见），远距离再用深度的 18%。
     const double plate_h = (type == ArmorType::LARGE) ? large_height_mm_ : small_height_mm_;
     const double len = std::max(5.0 * plate_h, 0.18 * origin.z);
     const cv::Point3d tip(origin.x + normal_cam[0] * len,
@@ -498,8 +502,8 @@ void ArmorBoard::draw_normal(cv::Mat& img) const {
 }
 
 /**
- * 作用：IPPE 给初值，再锁安装俯仰只搜 yaw（同济方案），俯仰不再随双根跳变。
- * 输入：无（读 type 与四端点）。输出：成功且深度合法为 true。
+ * 作用：IPPE 给初值，再锁安装俯仰只搜 yaw；搜 yaw 时加上两个灯心。
+ * 输入：无（读 type、四端点、左右灯心）。输出：成功且深度合法为 true。
  */
 bool ArmorBoard::solvePnP() {
     pnp_ok = false;
@@ -509,10 +513,19 @@ bool ArmorBoard::solvePnP() {
     rvec.release();
     tvec.release();
 
-    // 物点：实际板面 objectCornersMm。像点：缩放后的装甲四角（与画框同一套）。
+    // 物点：灯心距 × 灯条长。像点：左右灯长轴端点（与画框同一套）。
     const std::vector<cv::Point3f> object_points = objectCornersMm(type);
     const std::vector<cv::Point2f> image_points = {
         left_bottom, left_top, right_top, right_bottom};
+
+    // 灯心：左右边中点。比长轴端点稳，只进锁俯仰的 t / 代价，不进 IPPE（IPPE 要四点平面矩形）。
+    const float half_x = std::abs(object_points[0].x);
+    std::vector<cv::Point3f> refine_object = object_points;
+    std::vector<cv::Point2f> refine_image = image_points;
+    refine_object.push_back({-half_x, 0.f, 0.f});
+    refine_object.push_back({half_x, 0.f, 0.f});
+    refine_image.push_back(left.center());
+    refine_image.push_back(right.center());
 
     std::vector<cv::Mat> rvecs;
     std::vector<cv::Mat> tvecs;
@@ -585,7 +598,7 @@ bool ArmorBoard::solvePnP() {
     // 同济：安装俯仰钉死，只搜 yaw。IPPE 的俯仰双根从此不再进入最终 R。
     cv::Mat r_lock = rvec.clone();
     cv::Mat t_lock = tvec.clone();
-    if (refineYawLockedPitch(object_points, image_points, camera_matrix_, dist_coeffs_,
+    if (refineYawLockedPitch(refine_object, refine_image, camera_matrix_, dist_coeffs_,
                              armor_pitch_deg_, r_lock, t_lock)) {
         rvec = r_lock;
         tvec = t_lock;
@@ -614,10 +627,10 @@ bool ArmorBoard::loadPnpConfig(const std::string& path) {
 
     const cv::FileNode pnp = fs["pnp"];
     readYaml(pnp, "small_width_mm", small_width_mm_);
-    readYaml(pnp, "small_height_mm", small_height_mm_);  // 实际小板面高
+    readYaml(pnp, "small_height_mm", small_height_mm_);  // 实际小板面高，只给法线箭头
     readYaml(pnp, "large_width_mm", large_width_mm_);
-    readYaml(pnp, "large_height_mm", large_height_mm_);  // 实际大板面高
-    readYaml(pnp, "light_height_mm", light_height_mm_);  // 灯条矩形高，用来算像点缩放比
+    readYaml(pnp, "large_height_mm", large_height_mm_);  // 实际大板面高，只给法线箭头
+    readYaml(pnp, "light_height_mm", light_height_mm_);  // 灯条长 = PnP 物高
     readYaml(pnp, "armor_pitch_deg", armor_pitch_deg_);
 
     const cv::FileNode cam = fs["camera"];
