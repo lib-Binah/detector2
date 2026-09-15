@@ -14,6 +14,8 @@
  * 过程/量测函数由整车模型注入；本类只做 x=f(x)、P=FPFᵀ+Q、Joseph 更新、NIS/NEES。
  * yaw 等角度维用 x_add / z_subtract 折到 ±π，禁止直接 a-b 把 359° 当成大残差。
  * NIS 门槛与同济源码一致为 0.711（他们按 4 维 χ² 0.95 标注，数值本身过严）。
+ * last_innov_nis 是更新前的新息卡方（yᵀS⁻¹y，S=HPHᵀ+R），给下一帧放大/缩小 Q：
+ * 机动时新息大 → Q 变大几帧内跟上 v/ω；飞点时新息过大则抬 R 不追这一帧。
  */
 class ExtendedKalmanFilter {
 public:
@@ -27,6 +29,7 @@ public:
     std::deque<int> recent_nis_failures{0};
     std::size_t window_size = 100;
     double last_nis = 0.0;
+    double last_innov_nis = 0.0;  // 更新前新息卡方；自适应 Q 读这个，不要读后验 last_nis
 
     ExtendedKalmanFilter() = default;
 
@@ -64,8 +67,9 @@ public:
                            });
 
     /**
-     * 作用：非线性量测更新（Joseph 形式保持 P 对称正定），并记 NIS/NEES 供发散检测。
-     * 输入：z、H、R、h(x)、z_subtract。输出：更新后的 x；data["nis"] 为后验卡方量。
+     * 作用：非线性量测更新（Joseph 形式保持 P 对称正定），并记新息/后验 NIS、NEES。
+     * 输入：z、H、R、h(x)、z_subtract。输出：更新后的 x；data["innov_nis"] 为更新前卡方。
+     * 新息大于 χ²_4≈16 时把 R 按比例抬高再算 K，PnP 飞点不把 v/ω 拽飞。
      */
     Eigen::VectorXd update(const Eigen::VectorXd& z, const Eigen::MatrixXd& H, const Eigen::MatrixXd& R,
                            const VectorFunc& h, VectorSub z_subtract);

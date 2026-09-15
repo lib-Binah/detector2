@@ -4,6 +4,7 @@
  *
  * 同济 EKF 核（sp_vision_25 tools::ExtendedKalmanFilter）：预测用 F/Q，
  * 更新用 Joseph 稳定形式，后验残差做 NIS，状态修正做 NEES。
+ * 额外：更新前新息卡方写入 last_innov_nis；过大则抬 R 降权飞点，供整车自适应 Q。
  */
 #include "ekf.h"
 
@@ -15,6 +16,8 @@ namespace {
 // 同济源码按「4 维 χ² 0.95」写的门槛，数值是 0.711（标准分位实际是 9.488）。
 constexpr double kNisThreshold = 0.711;
 constexpr double kNeesThreshold = 0.711;
+// 4 维量测 χ² 0.997 大约 16：超过则当飞点，抬 R 而不是让这一帧去改 v/ω。
+constexpr double kOutlierInnovNis = 16.0;
 
 }  // namespace
 
@@ -30,10 +33,12 @@ ExtendedKalmanFilter::ExtendedKalmanFilter(const Eigen::VectorXd& x0, const Eige
     data["residual_distance"] = 0.0;
     data["residual_angle"] = 0.0;
     data["nis"] = 0.0;
+    data["innov_nis"] = 0.0;
     data["nees"] = 0.0;
     data["nis_fail"] = 0.0;
     data["nees_fail"] = 0.0;
     data["recent_nis_failures"] = 0.0;
+    last_innov_nis = 0.0;
 }
 
 /**
@@ -71,11 +76,21 @@ Eigen::VectorXd ExtendedKalmanFilter::update(const Eigen::VectorXd& z, const Eig
                                              const Eigen::MatrixXd& R, const VectorFunc& h,
                                              VectorSub z_subtract) {
     const Eigen::VectorXd x_prior = x;
-    Eigen::MatrixXd K = P * H.transpose() * (H * P * H.transpose() + R).inverse();
+    const Eigen::VectorXd y = z_subtract(z, h(x));  // 先验残差，角度已折 ±π
+    const Eigen::MatrixXd S_prior = H * P * H.transpose() + R;
+    last_innov_nis = y.transpose() * S_prior.inverse() * y;
+    data["innov_nis"] = last_innov_nis;
+
+    // 飞点：新息过大则抬 R 再算 K，这一帧几乎不改速度；真机动走下一帧自适应 Q。
+    Eigen::MatrixXd R_use = R;
+    if (total_count_ >= 2 && last_innov_nis > kOutlierInnovNis)
+        R_use = R * (last_innov_nis / kOutlierInnovNis);
+
+    Eigen::MatrixXd K = P * H.transpose() * (H * P * H.transpose() + R_use).inverse();
 
     // Joseph：P=(I-KH)P(I-KH)ᵀ+KRKᵀ，比 (I-KH)P 更能保持对称正定（同济/rlabbe）。
-    P = (I_ - K * H) * P * (I_ - K * H).transpose() + K * R * K.transpose();
-    x = x_add_(x, K * z_subtract(z, h(x)));
+    P = (I_ - K * H) * P * (I_ - K * H).transpose() + K * R_use * K.transpose();
+    x = x_add_(x, K * y);
 
     const Eigen::VectorXd residual = z_subtract(z, h(x));
     Eigen::MatrixXd S = H * P * H.transpose() + R;

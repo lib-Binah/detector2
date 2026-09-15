@@ -3,6 +3,7 @@
  * 检测读 ArmorBoard::positionMm / normal_cam / dist_m / number，禁止另算 PnP。
  * 每个函数须写清作用/输入/输出；调用处注明意图。
  * 滤波流程对齐同济 Target/Tracker：单板+半径 init，每块板都更新 r，不在首帧量测。
+ * v/ω 用新息自适应 Q + 速度维遗忘 + 首帧位移初值，既少抖又能在机动后几帧跟上。
  * 只有 Tracking 且本帧同时看见两块同号同色板才按（数字,颜色）缓存 r/l/h；
  * reset/seek 不丢缓存，再锁同车时直接用。单板不记，避免 r 与车心糊在一起。
  */
@@ -118,10 +119,33 @@ Eigen::MatrixXd processQ(double dt, double v1, double v2) {
     return Q;
 }
 
+/**
+ * 作用：只把 vxc/vyc/vzc/vyaw 的方差和相关按 fade 放大，位置/半径不动。
+ * 原理：量测多了以后这些维的 P 会收死，匀速假设跟不上加速；每帧略抬高保持增益。
+ * 输入：P 为 11×11；fade>1。输出：就地改 P，保持对称。
+ */
+void fadeVelocityCov(Eigen::MatrixXd& P, double fade) {
+    if (fade <= 1.0 || P.rows() < 8 || P.cols() < 8)
+        return;
+    const int idx[4] = {1, 3, 5, 7};
+    const double s = std::sqrt(fade);
+    for (int k = 0; k < 4; ++k) {
+        const int i = idx[k];
+        for (int j = 0; j < P.cols(); ++j) {
+            if (j == i)
+                continue;
+            P(i, j) *= s;
+            P(j, i) *= s;
+        }
+        P(i, i) *= fade;
+    }
+    P = 0.5 * (P + P.transpose());
+}
+
 }  // namespace
 
 /**
- * 作用：YAML aim → 半径/Q/状态机。输入：path。输出：打开成功为 true。
+ * 作用：YAML aim → 半径/Q/自适应缩放/速度遗忘/状态机。输入：path。输出：打开成功为 true。
  */
 bool VehicleTracker::loadConfig(const std::string& path) {
     cv::FileStorage fs;
@@ -131,6 +155,10 @@ bool VehicleTracker::loadConfig(const std::string& path) {
     readYaml(n, "default_radius_m", params_.default_radius_m);
     readYaml(n, "q_acc", params_.q_acc);
     readYaml(n, "q_alpha", params_.q_alpha);
+    readYaml(n, "q_adapt_ref", params_.q_adapt_ref);
+    readYaml(n, "q_adapt_min", params_.q_adapt_min);
+    readYaml(n, "q_adapt_max", params_.q_adapt_max);
+    readYaml(n, "vel_fade", params_.vel_fade);
     readYaml(n, "max_dt_s", params_.max_dt_s);
     readYaml(n, "min_detect_count", params_.min_detect_count);
     readYaml(n, "max_temp_lost_count", params_.max_temp_lost_count);
@@ -151,6 +179,7 @@ void VehicleTracker::reset() {
     temp_lost_count_ = 0;
     last_phase_id_ = 0;
     update_count_ = 0;
+    need_vel_bootstrap_ = false;
 }
 
 /**
@@ -291,25 +320,44 @@ void VehicleTracker::initEkf(const ArmorBoard& armor, const VehicleGeomPrior* pr
     ekf_ready_ = true;
     last_phase_id_ = 0;
     update_count_ = 0;
+    need_vel_bootstrap_ = true;  // 下一帧匹配后用位移填 v/ω
 }
 
 /**
  * 作用：predict(dt) 后，把同 ID 的板按相位匹配进 EKF。
  * 同济 update_target：先预测，再对每块同名板 update；不冻 r。
+ * Q 按上一帧新息缩放：匀速缩小、机动放大；预测后再抬 v/ω 的 P。
  */
 bool VehicleTracker::updateTarget(const std::vector<ArmorBoard>& armors, double dt) {
     if (!ekf_ready_)
         return false;
     if (dt > 1e-6) {
         const Eigen::MatrixXd F = processF(dt);
-        const Eigen::MatrixXd Q = processQ(dt, params_.q_acc, params_.q_alpha);
+        // 4 维量测 χ² 均值约 4。新息小 → 缩 Q 抗 PnP 抖；中等/大 → 放 Q 跟上加速。
+        // 极大新息当飞点，不放 Q。丢目标期间把 Q 拉满，再看见时 P 已经够大，v/ω 能立刻改。
+        double q_scale = 1.0;
+        const double innov = ekf_.last_innov_nis;
+        if (state_ == VehicleTrackState::TempLost) {
+            q_scale = params_.q_adapt_max;
+        } else if (innov > 1e-9 && innov < 40.0 && params_.q_adapt_ref > 1e-6) {
+            q_scale = std::clamp(innov / params_.q_adapt_ref, params_.q_adapt_min,
+                                 params_.q_adapt_max);
+        }
+        // 锁车后前几帧强制较大 Q，让位移尽快变成 v/ω，之后再按新息收紧。
+        if (need_vel_bootstrap_ || update_count_ < 4)
+            q_scale = std::max(q_scale, std::min(8.0, params_.q_adapt_max));
+        const Eigen::MatrixXd Q =
+            processQ(dt, params_.q_acc * q_scale, params_.q_alpha * q_scale);
         auto f = [&](const Eigen::VectorXd& x) {
             Eigen::VectorXd xp = F * x;
             xp[6] = limitRad(xp[6]);
             return xp;
         };
         ekf_.predict(F, Q, f);  // 匀速+匀角速推到本帧，yaw 折 ±π
+        fadeVelocityCov(ekf_.P, params_.vel_fade);  // 只抬 v/ω 不确定度
     }
+    // 量测后再用后验位移写 v/ω，避免「先写速度再更新」把同一段位移算两遍。
+    const Eigen::VectorXd x_pred = ekf_.x;
 
     int found = 0;
     const ArmorBoard* unlabeled_best = nullptr;
@@ -365,7 +413,25 @@ bool VehicleTracker::updateTarget(const std::vector<ArmorBoard>& armors, double 
         last_phase_id_ = 0;
         ++found;
     }
+    // 锁车后第一帧量测：v/ω = 后验车心位移 / dt。匹配失败则留到下一帧再试。
+    if (need_vel_bootstrap_ && found > 0 && dt > 1e-3)
+        bootstrapVelFromArmor(x_pred, dt);
     return found > 0;
+}
+
+/**
+ * 作用：用「量测后车心 − 预测车心」/ dt 覆盖 v/ω。
+ * 锁车时 v=ω=0，Kalman 增益只吃一部分位移；这里写成整段平均速度，下一帧预测就能对齐机动。
+ * 输入：x_pred 为预测后、量测前的 11 维；dt>0。输出：改 ekf_.x 的 1/3/5/7；限幅 8 m/s、20 rad/s。
+ */
+void VehicleTracker::bootstrapVelFromArmor(const Eigen::VectorXd& x_pred, double dt) {
+    if (dt < 1e-3 || x_pred.size() < 8 || ekf_.x.size() < 8)
+        return;
+    ekf_.x[1] = std::clamp((ekf_.x[0] - x_pred[0]) / dt, -8.0, 8.0);
+    ekf_.x[3] = std::clamp((ekf_.x[2] - x_pred[2]) / dt, -8.0, 8.0);
+    ekf_.x[5] = std::clamp((ekf_.x[4] - x_pred[4]) / dt, -8.0, 8.0);
+    ekf_.x[7] = std::clamp(limitRad(ekf_.x[6] - x_pred[6]) / dt, -20.0, 20.0);
+    need_vel_bootstrap_ = false;
 }
 
 /**

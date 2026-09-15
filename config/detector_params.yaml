@@ -127,10 +127,18 @@ aim:
   # 同济步兵锁车半径初值（m）。车心 = 板心沿背法线推这么远；l=h 固定从 0 起，由侧面量测学。
   # 改完须重启并重新锁车（seek 或丢目标）。
   default_radius_m: 0.20
-  # 平移加速度方差（同济 piecewise white noise v1）。
+  # 平移加速度方差（同济 piecewise white noise v1）。实际 Q 再乘新息缩放。
   q_acc: 100
-  # 角加速度方差（同济 v2）。
+  # 角加速度方差（同济 v2）。实际 Q 再乘新息缩放。
   q_alpha: 400
+  # 新息 χ² 名义值（4 维量测均值约 4）。innov/该值 → Q 倍率；越大越不轻易放大 Q。
+  q_adapt_ref: 4.0
+  # 匀速、新息小时 Q 缩到这么多倍，车心/ω 少跟 PnP 抖。
+  q_adapt_min: 0.35
+  # 机动或短暂丢失时 Q 最多放大这么多倍，几帧内跟上整车 v/ω。
+  q_adapt_max: 20.0
+  # 每帧把 v/ω 的 P 乘这么多，防止协方差收死后永远跟不上加速。1=关闭。
+  vel_fade: 1.04
   # 帧间隔超过该秒数视为掉线，重置 EKF（同济 0.1）。
   max_dt_s: 0.10
   # 连续匹配这么多帧才从 detecting 进入 tracking（同济 min_detect_count）。

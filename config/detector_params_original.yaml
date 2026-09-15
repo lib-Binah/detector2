@@ -124,6 +124,12 @@ aim:
   default_radius_m: 0.20
   q_acc: 100.0
   q_alpha: 400.0
+  # 新息 χ² 名义值；innov/该值 → Q 倍率。
+  q_adapt_ref: 4.0
+  q_adapt_min: 0.35
+  q_adapt_max: 20.0
+  # 每帧放大 v/ω 的 P，防止收死。
+  vel_fade: 1.04
   max_dt_s: 0.10
   min_detect_count: 3
   max_temp_lost_count: 15

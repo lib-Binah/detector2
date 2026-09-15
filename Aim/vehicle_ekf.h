@@ -27,12 +27,18 @@
  * 锁车只按最近一块板 + 给定半径 init，l=h=0，P0 的 r/l/h 为 1；量测从下一帧开始。
  * 跟踪进入 Tracking 且本帧同时看见两块同号同色板时，按（数字, 颜色）缓存 r/l/h；
  * 再锁同号同色车时用缓存当几何初值，P0 的 r/l/h 很小。单板不记，避免 r 与车心糊在一起。
+ * v/ω：首帧量测前用车心位移/转角差给初值；之后用新息放大 Q（机动跟上）、过小新息缩小 Q（少抖），
+ * 每帧再把 v/ω 的 P 略放大，避免协方差收死后永远跟不上加速。
  */
 struct VehicleEkfParams {
     // 同济步兵/英雄/平衡：沿板背法线推车心的 r 初值（米）。yaml aim.default_radius_m，默认 0.2。
     double default_radius_m = 0.20;
     double q_acc = 100.0;            // 平移加速度方差（同济 piecewise white noise v1）
     double q_alpha = 400.0;          // 角加速度方差（同济 v2）
+    double q_adapt_ref = 4.0;        // 新息 χ² 名义值（4 维量测均值）；越大越不轻易放大 Q
+    double q_adapt_min = 0.35;       // 新息小时 Q 缩到这么多倍，匀速段更平滑
+    double q_adapt_max = 20.0;       // 新息大时 Q 最多放大这么多倍，几帧内跟上加速/起转
+    double vel_fade = 1.04;          // 每帧把 v/ω 的 P 乘这么多，防止收死
     double max_dt_s = 0.10;          // 同济相机离线门槛 0.1s
     int min_detect_count = 3;        // 连续匹配这么多帧才从 detecting → tracking
     int max_temp_lost_count = 15;    // 短暂丢失超过这么多帧 → lost
@@ -60,7 +66,7 @@ public:
     VehicleTracker() = default;
 
     /**
-     * 作用：从 YAML 的 aim 节点读半径、Q、状态机与 NIS 门槛。
+     * 作用：从 YAML 的 aim 节点读半径、Q、自适应缩放、速度遗忘、状态机与 NIS 门槛。
      * 输入：path 为 detector_params.yaml。输出：true 表示文件打开成功；缺键保持默认。
      */
     bool loadConfig(const std::string& path);
@@ -126,6 +132,7 @@ private:
     int last_phase_id_ = 0;
     int tracked_color_ = 0;  // 1 红 / 2 蓝；与 ArmorBoard::color 同源
     int update_count_ = 0;   // 本段跟踪的 ypda 次数
+    bool need_vel_bootstrap_ = false;  // 锁车后第一次匹配时用位移给 v/ω
     // 键：(number, color)。reset / seek 不丢，同号同色再锁车时复用 r/l/h。
     std::map<std::pair<int, int>, VehicleGeomPrior> geom_priors_;
 
@@ -139,6 +146,11 @@ private:
      * 输出：≥2 且 Tracking 时覆盖该（数字,颜色）缓存；否则不写。
      */
     void maybeSaveGeomPrior(int n_visible_plates);
+    /**
+     * 作用：锁车后第一帧量测结束，用后验相对预测的位移 / dt 写入 v/ω，避免从 0 爬很多帧。
+     * 输入：x_pred 为预测后状态；dt>0。输出：改 ekf_.x 的 vxc/vyc/vzc/vyaw；成功则清 need_vel_bootstrap_。
+     */
+    void bootstrapVelFromArmor(const Eigen::VectorXd& x_pred, double dt);
     void updateYpda(const ArmorBoard& armor, int phase_id);
     Eigen::Vector3d armorXyz(const Eigen::VectorXd& x, int id) const;
     Eigen::MatrixXd hJacobian(const Eigen::VectorXd& x, int id) const;
