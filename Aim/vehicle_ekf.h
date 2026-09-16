@@ -24,6 +24,10 @@
  * za = zc - r cos(yaw+id·2π/n)；与 init 的 xc = xa + r sinθ 互为逆。
  * 四装甲 id=1/3 用 r+l 和 yc+h。量测 z = (LOS yaw, pitch, 距离, 装甲 yaw)，H = H_ypd · H_xyza。
  * 同济每块可见板都做 ypda 更新，不冻 r；l/h 只在 id=1/3 的雅可比里非零。
+ * 锁车板固定相位 0。转到相位 1/3（差 90°）时，用观测 Y 对 yc+h 与 yc−h 比误差，
+ * 决定这块板比锁车板更高还是更低（只改 h 符号/初值），并冻 yc，禁止用车心高度去贴 90° 板。
+ * 90° 邻板常是另一种大小，匹配只要求同号同色，不要求 type。
+ * r 与 r+l 有 yaml 上限（max_r_m / max_r_l_m），更新后钳位，避免半径被量测拉飞；小于 0.05 仍丢目标。
  * 锁车只按最近一块板 + 给定半径 init，l=h=0，P0 的 r/l/h 为 1；量测从下一帧开始。
  * 跟踪进入 Tracking 且本帧同时看见两块同号同色板时，按（数字, 颜色）缓存 r/l/h；
  * 再锁同号同色车时用缓存当几何初值，P0 的 r/l/h 很小。单板不记，避免 r 与车心糊在一起。
@@ -33,6 +37,8 @@
 struct VehicleEkfParams {
     // 同济步兵/英雄/平衡：沿板背法线推车心的 r 初值（米）。yaml aim.default_radius_m，默认 0.2。
     double default_radius_m = 0.20;
+    double max_r_m = 0.50;           // 相位 0/2 半径 r 上限（米）；yaml max_r_m
+    double max_r_l_m = 0.50;         // 相位 1/3 半径 r+l 上限（米）；yaml max_r_l_m
     double q_acc = 100.0;            // 平移加速度方差（同济 piecewise white noise v1）
     double q_alpha = 400.0;          // 角加速度方差（同济 v2）
     double q_adapt_ref = 4.0;        // 新息 χ² 名义值（4 维量测均值）；越大越不轻易放大 Q
@@ -66,7 +72,7 @@ public:
     VehicleTracker() = default;
 
     /**
-     * 作用：从 YAML 的 aim 节点读半径、Q、自适应缩放、速度遗忘、状态机与 NIS 门槛。
+     * 作用：从 YAML 的 aim 节点读半径初值与上限、Q、自适应缩放、速度遗忘、状态机与 NIS 门槛。
      * 输入：path 为 detector_params.yaml。输出：true 表示文件打开成功；缺键保持默认。
      */
     bool loadConfig(const std::string& path);
@@ -133,6 +139,7 @@ private:
     int tracked_color_ = 0;  // 1 红 / 2 蓝；与 ArmorBoard::color 同源
     int update_count_ = 0;   // 本段跟踪的 ypda 次数
     bool need_vel_bootstrap_ = false;  // 锁车后第一次匹配时用位移给 v/ω
+    bool odd_h_resolved_ = false;  // 本段跟踪是否已用 90° 板的 yc±h 误差定过高低
     // 键：(number, color)。reset / seek 不丢，同号同色再锁车时复用 r/l/h。
     std::map<std::pair<int, int>, VehicleGeomPrior> geom_priors_;
 
@@ -142,16 +149,34 @@ private:
     void initEkf(const ArmorBoard& armor, const VehicleGeomPrior* prior);
     /**
      * 作用：双板可见时把当前 r/l/h 写入 geom_priors_。
-     * 输入：n_visible_plates 为本帧该车 pnp_ok 且同号同色同类型的板数。
+     * 输入：n_visible_plates 为本帧该车 pnp_ok 且同号同色的板数（大小板都算，90° 邻板常不同 type）。
      * 输出：≥2 且 Tracking 时覆盖该（数字,颜色）缓存；否则不写。
      */
     void maybeSaveGeomPrior(int n_visible_plates);
+    /**
+     * 作用：把 r、r+l 压进 yaml 上限，防止半径被量测拉飞。
+     * 输入：无（读 max_r_m / max_r_l_m 与 x[8]、x[9]、x[10]）。输出：就地改 ekf_.x 的 r、l、h；不改车心。
+     */
+    void clampArmorRadii();
     /**
      * 作用：锁车后第一帧量测结束，用后验相对预测的位移 / dt 写入 v/ω，避免从 0 爬很多帧。
      * 输入：x_pred 为预测后状态；dt>0。输出：改 ekf_.x 的 vxc/vyc/vzc/vyaw；成功则清 need_vel_bootstrap_。
      */
     void bootstrapVelFromArmor(const Eigen::VectorXd& x_pred, double dt);
-    void updateYpda(const ArmorBoard& armor, int phase_id);
+    /**
+     * 作用：第一次看到相位 1/3 时，用观测 Y 对 yc+h、yc−h 做误差，判定 90° 板更高还是更低。
+     * |h|≈0 则 h←观测Y−yc；否则谁更贴观测就保留或翻 h 的符号。不改 yc。
+     * 输入：meas_xyz 为该板 PnP 米制（与 armorXyzM 同一 tvec/1000）。
+     * 输出：改 x[10]；已决议过则直接返回。
+     */
+    void resolveOddPairHeight(const Eigen::Vector3d& meas_xyz);
+    /**
+     * 作用：ypda 量测更新。R 随视线偏角和距离变大（同济 log 式）。
+     * 输入：armor 为 pnp_ok 板；phase_id 为 0..n-1；freeze_hub_y 为 true 时冻 yc/vyc
+     * （90° 板的高低差只进 h，避免车心被整段高度差拽飞）。
+     * 输出：ekf_ 后验；freeze 时 x[2]、x[3] 保持更新前的值。
+     */
+    void updateYpda(const ArmorBoard& armor, int phase_id, bool freeze_hub_y = false);
     Eigen::Vector3d armorXyz(const Eigen::VectorXd& x, int id) const;
     Eigen::MatrixXd hJacobian(const Eigen::VectorXd& x, int id) const;
     static int armorCountFor(const ArmorBoard& armor);

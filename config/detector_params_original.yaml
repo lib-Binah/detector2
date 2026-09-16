@@ -122,6 +122,10 @@ aim:
   # 飞时 车心 += kv·v·t。只乘预瞄用的 vx/vy/vz，不改 EKF。
   v_lead_scale: 1.0
   default_radius_m: 0.20
+  # 相位 0/2 半径 r 上限（米）。
+  max_r_m: 0.50
+  # 相位 1/3 半径 r+l 上限（米）。
+  max_r_l_m: 0.50
   q_acc: 100.0
   q_alpha: 400.0
   # 新息 χ² 名义值；innov/该值 → Q 倍率。

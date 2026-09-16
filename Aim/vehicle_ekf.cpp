@@ -3,9 +3,12 @@
  * 检测读 ArmorBoard::positionMm / normal_cam / dist_m / number，禁止另算 PnP。
  * 每个函数须写清作用/输入/输出；调用处注明意图。
  * 滤波流程对齐同济 Target/Tracker：单板+半径 init，每块板都更新 r，不在首帧量测。
+ * r 与 r+l 用 yaml 上限钳位；小于 0.05 仍丢目标。
  * v/ω 用新息自适应 Q + 速度维遗忘 + 首帧位移初值，既少抖又能在机动后几帧跟上。
  * 只有 Tracking 且本帧同时看见两块同号同色板才按（数字,颜色）缓存 r/l/h；
  * reset/seek 不丢缓存，再锁同车时直接用。单板不记，避免 r 与车心糊在一起。
+ * 锁车板是相位 0；转到 1/3 时用观测 Y 对 yc±h 定高低，冻车心，不靠 yc 去贴 90° 板。
+ * 匹配同号同色即可，不要求大小板类型（90° 邻板经常一大一小）。
  */
 #include "vehicle_ekf.h"
 
@@ -19,6 +22,8 @@
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kMaxAbsH = 0.35;   // |h| 上限（米）：装甲高低差不可能到这么大
+constexpr double kHSignEps = 0.02;  // |h| 小于此则 yc±h 分不开，用观测相对 yc 定符号
 
 /**
  * 作用：把角折到 (-π, π]（同济 tools::limit_rad：>π 减、≤−π 加）。
@@ -142,10 +147,26 @@ void fadeVelocityCov(Eigen::MatrixXd& P, double fade) {
     P = 0.5 * (P + P.transpose());
 }
 
+/**
+ * 作用：把一对 (r, l) 压进半径上限。r 是 0/2，r+l 是 1/3。
+ * 输入：r/l 引用；max_r、max_rl 为上限（米），非正则当 0.5。
+ * 输出：就地改 r、l，使 r≤max_r 且 r+l≤max_rl。
+ */
+void clampRl(double& r, double& l, double max_r, double max_rl) {
+    if (!(max_r > 1e-6))
+        max_r = 0.5;
+    if (!(max_rl > 1e-6))
+        max_rl = 0.5;
+    r = std::min(r, max_r);
+    const double rl = std::min(r + l, max_rl);
+    l = rl - r;
+}
+
 }  // namespace
 
 /**
- * 作用：YAML aim → 半径/Q/自适应缩放/速度遗忘/状态机。输入：path。输出：打开成功为 true。
+ * 作用：YAML aim → 半径初值与上限 / Q / 自适应缩放 / 速度遗忘 / 状态机。
+ * 输入：path。输出：打开成功为 true。
  */
 bool VehicleTracker::loadConfig(const std::string& path) {
     cv::FileStorage fs;
@@ -153,6 +174,8 @@ bool VehicleTracker::loadConfig(const std::string& path) {
         return false;
     const cv::FileNode n = fs["aim"];
     readYaml(n, "default_radius_m", params_.default_radius_m);
+    readYaml(n, "max_r_m", params_.max_r_m);
+    readYaml(n, "max_r_l_m", params_.max_r_l_m);
     readYaml(n, "q_acc", params_.q_acc);
     readYaml(n, "q_alpha", params_.q_alpha);
     readYaml(n, "q_adapt_ref", params_.q_adapt_ref);
@@ -163,6 +186,10 @@ bool VehicleTracker::loadConfig(const std::string& path) {
     readYaml(n, "min_detect_count", params_.min_detect_count);
     readYaml(n, "max_temp_lost_count", params_.max_temp_lost_count);
     readYaml(n, "nis_fail_rate", params_.nis_fail_rate);
+    if (!(params_.max_r_m > 1e-6))
+        params_.max_r_m = 0.5;
+    if (!(params_.max_r_l_m > 1e-6))
+        params_.max_r_l_m = 0.5;
     return true;
 }
 
@@ -180,6 +207,7 @@ void VehicleTracker::reset() {
     last_phase_id_ = 0;
     update_count_ = 0;
     need_vel_bootstrap_ = false;
+    odd_h_resolved_ = false;
 }
 
 /**
@@ -193,6 +221,7 @@ int VehicleTracker::armorCountFor(const ArmorBoard& armor) {
 
 /**
  * 作用：本帧同时看到两块同号同色板、且已 Tracking 时，把 r/l/h 记到（数字,颜色）下。
+ * 大小板都计入：90° 邻板常不同 type，同帧一大一小才能把 h 从 yc 里拆开。
  * 单板不写：正对一块时 r 与车心深度分不清。输入：本帧该车 pnp_ok 板数。输出：满足时写入 geom_priors_。
  */
 void VehicleTracker::maybeSaveGeomPrior(int n_visible_plates) {
@@ -207,6 +236,22 @@ void VehicleTracker::maybeSaveGeomPrior(int n_visible_plates) {
     p.l_m = ekf_.x[9];
     p.h_m = ekf_.x[10];
     geom_priors_[{tracked_id_, tracked_color_}] = p;
+}
+
+/**
+ * 作用：把当前状态的 r、r+l 压进 yaml 上限，并把 |h| 压进装甲高低差上限。
+ * 输入：无。输出：改 ekf_.x[8]、x[9]、x[10]。
+ */
+void VehicleTracker::clampArmorRadii() {
+    if (!ekf_ready_ || ekf_.x.size() < 10)
+        return;
+    double r = ekf_.x[8];
+    double l = ekf_.x[9];
+    clampRl(r, l, params_.max_r_m, params_.max_r_l_m);  // 0/2 的 r、1/3 的 r+l
+    ekf_.x[8] = r;
+    ekf_.x[9] = l;
+    if (ekf_.x.size() >= 11)
+        ekf_.x[10] = std::clamp(ekf_.x[10], -kMaxAbsH, kMaxAbsH);  // 高低差不得用飞点 PnP 撑破
 }
 
 /**
@@ -225,10 +270,12 @@ void VehicleTracker::step(const std::vector<ArmorBoard>& armors, double dt) {
     stateMachine(found);
 
     if (state_ != VehicleTrackState::Lost && ekf_ready_) {
+        clampArmorRadii();  // r、r+l 压到 yaml 上限，超限不再丢车
         const double r = ekf_.x[8];
         const double r2 = r + ekf_.x[9];
-        const bool r_ok = r > 0.05 && r < 0.5;
-        const bool l_ok = r2 > 0.05 && r2 < 0.5;
+        // 下限仍是 0.05 m：半径瘪掉时圆周退化，丢掉重锁。
+        const bool r_ok = r > 0.05;
+        const bool l_ok = r2 > 0.05;
         if (!r_ok || !l_ok)
             reset();
         else {
@@ -238,13 +285,12 @@ void VehicleTracker::step(const std::vector<ArmorBoard>& armors, double dt) {
             if (nis_fail >= params_.nis_fail_rate * static_cast<double>(ekf_.window_size))
                 reset();
             else {
-                // 只数本帧这辆车：pnp_ok 且数字/类型/颜色都对上。两块才能把 r 从车心里拆开。
+                // 只数本帧这辆车：pnp_ok 且数字/颜色对上。大小板都算，两块才能把 r/h 从车心里拆开。
                 int n_visible = 0;
                 for (const auto& a : armors) {
                     if (!a.pnp_ok)
                         continue;
-                    if (a.number == tracked_id_ && a.type == tracked_type_ &&
-                        a.color() == tracked_color_)
+                    if (a.number == tracked_id_ && a.color() == tracked_color_)
                         ++n_visible;
                 }
                 maybeSaveGeomPrior(n_visible);  // 同帧两块同号同色板才记 r/l/h
@@ -297,9 +343,11 @@ bool VehicleTracker::setTarget(const std::vector<ArmorBoard>& armors) {
 void VehicleTracker::initEkf(const ArmorBoard& armor, const VehicleGeomPrior* prior) {
     const Eigen::Vector3d xyz = armorXyzM(armor);
     const double yaw = armorYaw(armor);
-    const double r = prior ? prior->r_m : params_.default_radius_m;
-    const double l = prior ? prior->l_m : 0.0;
-    const double h = prior ? prior->h_m : 0.0;
+    double r = prior ? prior->r_m : params_.default_radius_m;
+    double l = prior ? prior->l_m : 0.0;
+    double h = prior ? prior->h_m : 0.0;
+    clampRl(r, l, params_.max_r_m, params_.max_r_l_m);  // 缓存/初值也不得超过半径上限
+    h = std::clamp(h, -kMaxAbsH, kMaxAbsH);
     const double p_rlh = prior ? 1e-4 : 1.0;  // 有缓存则几乎锁死几何，只估本帧位姿/速度
     // 相机系：xc=xa+r sinθ，zc=za+r cosθ，对应同济世界系 xc=xa+r cosθ、yc=ya+r sinθ。
     const double xc = xyz[0] + r * std::sin(yaw);
@@ -321,6 +369,7 @@ void VehicleTracker::initEkf(const ArmorBoard& armor, const VehicleGeomPrior* pr
     last_phase_id_ = 0;
     update_count_ = 0;
     need_vel_bootstrap_ = true;  // 下一帧匹配后用位移填 v/ω
+    odd_h_resolved_ = false;     // 尚未用 90° 板对 yc±h 定高低
 }
 
 /**
@@ -367,7 +416,10 @@ bool VehicleTracker::updateTarget(const std::vector<ArmorBoard>& armors, double 
         if (!a.pnp_ok)
             continue;
         if (tracked_id_ > 0) {
-            if (a.number != tracked_id_ || a.type != tracked_type_)
+            // 同号同色即这辆车；90° 邻板经常 type 不同，不能当另一辆扔掉。
+            if (a.number != tracked_id_)
+                continue;
+            if ((tracked_color_ == 1 || tracked_color_ == 2) && a.color() != tracked_color_)
                 continue;
         } else {
             if (a.number != 0)
@@ -404,7 +456,11 @@ bool VehicleTracker::updateTarget(const std::vector<ArmorBoard>& armors, double 
                 best_id = id;
             }
         }
-        updateYpda(a, best_id);  // ypd+装甲 yaw → 后验；r/l/h 按 H 列更新
+        // 相位 1/3 相对锁车相位 0 差 90°：先用 yc±h 定这块更高还是更低，再冻车心做量测。
+        const bool odd90 = (armor_num_ == 4) && (best_id == 1 || best_id == 3);
+        if (odd90)
+            resolveOddPairHeight(meas_xyz);  // 观测 Y vs yc+h / yc−h → 只改 h
+        updateYpda(a, best_id, odd90);  // ypd+装甲 yaw → 后验；1/3 冻 yc，高低差进 h
         last_phase_id_ = best_id;
         ++found;
     }
@@ -435,12 +491,46 @@ void VehicleTracker::bootstrapVelFromArmor(const Eigen::VectorXd& x_pred, double
 }
 
 /**
+ * 作用：第一次匹配到相位 1/3 时，比较观测 Y 与 yc+h、yc−h，判定 90° 板比锁车板更高还是更低。
+ * 原理：单次量测 y=yc+h，yc 与 h 线性相关；若把残差分给 yc，旋转中心会整段跳。
+ * |h| 太小则 ± 重合，h←观测Y−yc；否则只在 yc−h 明显更贴时翻符号。不改 yc。
+ * 输入：该板 PnP 米制。输出：改 x[10]；已决议则返回。
+ */
+void VehicleTracker::resolveOddPairHeight(const Eigen::Vector3d& meas_xyz) {
+    if (odd_h_resolved_ || !ekf_ready_ || ekf_.x.size() < 11)
+        return;
+    const double yc = ekf_.x[2];
+    double h = ekf_.x[10];
+    const double y_obs = meas_xyz[1];  // 相机 Y 向下，与 yc、h 同一轴，读 PnP tvec
+    const double err_plus = std::abs(y_obs - (yc + h));
+    const double err_minus = std::abs(y_obs - (yc - h));
+    if (std::abs(h) < kHSignEps) {
+        // ±h 分不开：高低差就是这块板相对锁车高度的观测差
+        h = y_obs - yc;
+    } else if (err_minus + kHSignEps < err_plus) {
+        // yc−h 更贴观测：缓存/滤波把 90° 对的高低搞反了，只翻符号
+        h = -h;
+    }
+    ekf_.x[10] = std::clamp(h, -kMaxAbsH, kMaxAbsH);
+    if (ekf_.P.rows() >= 11 && ekf_.P.cols() >= 11)
+        ekf_.P(10, 10) = std::max(ekf_.P(10, 10), 1e-3);  // 刚钉住的 h 仍允许后续微调
+    odd_h_resolved_ = true;
+}
+
+/**
  * 作用：ypda 量测更新。R 随视线偏角和距离变大（同济 log 式）。
  * 同济每块板都更新 r；前后板 H 的 l/h 列为 0，侧面才改长短轴。
- * 输入：板、相位 id。输出：ekf_ 后验。
+ * freeze_hub_y：90° 板更新时把 yc/vyc 列置零并写回更新前的值，残差只进 h。
+ * 输入：板、相位 id、是否冻车心高度。输出：ekf_ 后验。
  */
-void VehicleTracker::updateYpda(const ArmorBoard& armor, int id) {
+void VehicleTracker::updateYpda(const ArmorBoard& armor, int id, bool freeze_hub_y) {
     Eigen::MatrixXd H = hJacobian(ekf_.x, id);
+    const double yc_keep = ekf_.x.size() > 3 ? ekf_.x[2] : 0.0;
+    const double vyc_keep = ekf_.x.size() > 3 ? ekf_.x[3] : 0.0;
+    if (freeze_hub_y && H.cols() >= 4) {
+        H.col(2).setZero();  // 冻 yc：90° 板高度差不得拽旋转中心
+        H.col(3).setZero();  // 冻 vyc，避免车心被「拽了一下」后往下冲
+    }
     const Eigen::Vector3d xyz = armorXyzM(armor);
     const double yaw = armorYaw(armor);
     // 同济 center_yaw=atan2(y,x)；相机水平面用 atan2(x,z)。
@@ -468,6 +558,10 @@ void VehicleTracker::updateYpda(const ArmorBoard& armor, int id) {
     Eigen::VectorXd z(4);
     z << ypd[0], ypd[1], ypd[2], yaw;
     ekf_.update(z, H, R, h, z_sub);  // ypd+装甲 yaw → 后验整车状态
+    if (freeze_hub_y && ekf_.x.size() > 3) {
+        ekf_.x[2] = yc_keep;  // 写回：Joseph 交叉项仍可能微移 yc
+        ekf_.x[3] = vyc_keep;
+    }
     ++update_count_;
 }
 

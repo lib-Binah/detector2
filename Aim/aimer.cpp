@@ -177,7 +177,8 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
         return tgt;
     tgt.hub_mm = tracker_.hubMm();
     tgt.hub_px = projectCamMm(tgt.hub_mm);
-    tgt.r_m = tracker_.ekf().x[8];
+    tgt.r_m = tracker_.ekf().x[8];                      // 0/2 半径 r，与 armorXyz 同一 x[8]
+    tgt.rl_m = tracker_.ekf().x[8] + tracker_.ekf().x[9];  // 1/3 半径 r+l，禁止另写半径
     tgt.vx_mps = tracker_.ekf().x[1];
     tgt.vy_mps = tracker_.ekf().x[3];
     tgt.vz_mps = tracker_.ekf().x[5];
@@ -237,8 +238,8 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
 }
 
 /**
- * 作用：青圈车心、四周预测板色块、橙十字弹道点、车心速度文字；读 AimTarget，不另算 v/ω。
- * 板矩形读 plate_quads（与 PnP 同物点）；k 画在 v/ω 旁，与飞时系数同一字段。
+ * 作用：青圈车心、四周预测板色块、橙十字弹道点、车心速度与半径文字；读 AimTarget，不另算 v/ω/r。
+ * 板矩形读 plate_quads（与 PnP 同物点）；k 画在 v/ω 旁，与飞时系数同一字段；r/r+l 读 r_m/rl_m。
  * hub 开时画车心→plate_px[facing_id]（本帧正对板板心），以及该板心→omega_tip_px 的 ω 切向箭头。
  * 连线/箭头读 AimTarget 已有像素与 vyaw，不另算圆周或角速度。
  * 输入：BGR 图、update 结果、开关。输出：无。
@@ -250,6 +251,7 @@ void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) 
         cv::circle(img, tgt.hub_px, 6, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
     if (flags.vel && tgt.hub_px.x >= 0.f) {
         // 线速度：旋转中心 3D 速率；xz 为水平面（相机 X 右 Z 前）。角速度读 EKF vyaw；kv/kw 为飞时系数。
+        // 下一行 r / r+l 读 AimTarget::r_m / rl_m，与圆周 0/2、1/3 半径同一对状态。
         const double v_lin = std::hypot(tgt.vx_mps, tgt.vy_mps, tgt.vz_mps);
         const double v_xz = std::hypot(tgt.vx_mps, tgt.vz_mps);
         const double w_deg = tgt.vyaw_rad_s * 180.0 / kPi;
@@ -262,6 +264,10 @@ void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) 
                     cv::format("w:%.2frad/s (%.0fdeg/s)*kw=%.2f", tgt.vyaw_rad_s, w_deg,
                                params_.w_lead_scale),
                     cv::Point(c.x + 10, c.y + 30), cv::FONT_HERSHEY_PLAIN, 0.95, cyan, 1,
+                    cv::LINE_AA);
+        // r、r+l：与 EKF 圆周同一对量，vel 开关一起显示
+        cv::putText(img, cv::format("r:%.3fm r+l:%.3fm", tgt.r_m, tgt.rl_m),
+                    cv::Point(c.x + 10, c.y + 44), cv::FONT_HERSHEY_PLAIN, 0.95, cyan, 1,
                     cv::LINE_AA);
     }
     if (flags.plates && !tgt.plate_quads.empty()) {

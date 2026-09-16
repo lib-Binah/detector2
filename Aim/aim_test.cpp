@@ -9,7 +9,7 @@
  * 两个窗口：
  *   displayimg   原图 + 可选灯条/装甲/距离/法线/车心/速度/预测板/预瞄；顶栏 FPS；只留 frame 进度条
  *   aim vis      0/1 进度条：light / armor / dist / nml / hub / vel / plates / aim / hud / txt
- *                       nml 默认关；dist 读 ArmorBoard::dist_m；vel 读 EKF 车心 v 与 ω
+ *                       nml 默认关；dist 读 ArmorBoard::dist_m；vel 读 EKF 车心 v、ω、r 与 r+l
  *                       plates 为预测板色块（与 PnP 同尺寸）；hub 开时青线连车心到正对预测板，
  *                       并在该板心画 ω 切向箭头（读 EKF vyaw）
  *                       txt=0 时不画画面上的字
@@ -189,7 +189,7 @@ Mat makeVisLegend() {
             0.42, Scalar(255, 0, 255), kFontThick, LINE_AA);
     putText(panel, "hub=cyan  center, line, omega arrow on facing plate", Point(8, 110), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(255, 255, 0), kFontThick, LINE_AA);
-    putText(panel, "vel=hub v m/s and w rad/s  (EKF vx,vy,vz,vyaw)", Point(8, 132),
+    putText(panel, "vel=hub v/w and r, r+l  (EKF vx..vyaw, x[8], x[8]+x[9])", Point(8, 132),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(255, 255, 0), kFontThick, LINE_AA);
     putText(panel, "plates=fill  EKF armor quads (PnP size, 4 colors)", Point(8, 154), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(0, 220, 0), kFontThick, LINE_AA);
