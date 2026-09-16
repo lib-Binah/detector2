@@ -1,127 +1,281 @@
 /**
- * 注释契约：禁止删本文件注释；改增益公式、Joseph 式或 NIS 门槛时必须改注释。
+ * 注释契约：禁止删本文件注释；改增益公式、Joseph 式、NLL 或部分更新时必须改注释。
  * 每个函数须写清作用/输入/输出；调用处注明送什么、得到什么。
  *
- * 同济 EKF 核（sp_vision_25 tools::ExtendedKalmanFilter）：预测用 F/Q，
- * 更新用 Joseph 稳定形式，后验残差做 NIS，状态修正做 NEES。
- * 额外：更新前新息卡方写入 last_innov_nis；过大则抬 R 降权飞点，供整车自适应 Q。
+ * lovod EKF 核：预测用 f/F/Q(dt)，选相用高斯 NLL，更新用 Joseph 保持 P 对称正定。
+ * yaw 残差必须 wrap 到 ±π。S 用 LDLT，不正定就放弃这一次评价。
  */
 #include "ekf.h"
 
-#include <numeric>
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <utility>
 
 namespace {
 
-// 同济源码按「4 维 χ² 0.95」写的门槛，数值是 0.711（标准分位实际是 9.488）。
-constexpr double kNisThreshold = 0.711;
-constexpr double kNeesThreshold = 0.711;
-// 4 维量测 χ² 0.997 大约 16：超过则当飞点，抬 R 而不是让这一帧去改 v/ω。
-constexpr double kOutlierInnovNis = 16.0;
+constexpr double kPi = 3.14159265358979323846;
+
+/**
+ * 作用：把角折到 (-π, π]。输入：任意弧度。输出：主值。
+ */
+double warp2Pi(double angle) {
+    while (angle > kPi)
+        angle -= 2.0 * kPi;
+    while (angle < -kPi)
+        angle += 2.0 * kPi;
+    return angle;
+}
 
 }  // namespace
 
 /**
- * 作用：写入 x0/P0 和角度加法。
- * 输入：x0、P0、x_add。输出：I 与 NIS/NEES 统计清零。
+ * 作用：检查函数指针并记下维数。输入：过程/量测及其雅可比、Q、R。输出：I 已分配。
  */
-ExtendedKalmanFilter::ExtendedKalmanFilter(const Eigen::VectorXd& x0, const Eigen::MatrixXd& P0,
-                                           VectorAdd x_add)
-    : x(x0), P(P0), I_(Eigen::MatrixXd::Identity(x0.rows(), x0.rows())), x_add_(std::move(x_add)) {
-    data["residual_yaw"] = 0.0;
-    data["residual_pitch"] = 0.0;
-    data["residual_distance"] = 0.0;
-    data["residual_angle"] = 0.0;
-    data["nis"] = 0.0;
-    data["innov_nis"] = 0.0;
-    data["nees"] = 0.0;
-    data["nis_fail"] = 0.0;
-    data["nees_fail"] = 0.0;
-    data["recent_nis_failures"] = 0.0;
-    last_innov_nis = 0.0;
+EKFCore::EKFCore(const ProcessNoiseFunc& process_noise_func, const ProcessFunc& process_func,
+                 const MeasurementFunc& measurement_func, const ProcessJacFunc& process_jacobian,
+                 const MeasurementJacFunc& measurement_jacobian, Eigen::MatrixXd Q,
+                 Eigen::MatrixXd R)
+    : process_noise_func_(process_noise_func),
+      process_func_(process_func),
+      measurement_func_(measurement_func),
+      process_jacobian_(process_jacobian),
+      measurement_jacobian_(measurement_jacobian),
+      Q_(std::move(Q)),
+      R_(std::move(R)) {
+    if (!process_func_ || !measurement_func_ || !process_jacobian_ || !measurement_jacobian_)
+        throw std::invalid_argument("EKFCore: process/measurement functors must be valid.");
+    state_dim_ = static_cast<int>(Q_.rows());
+    measurement_dim_ = static_cast<int>(R_.rows());
+    I_ = Eigen::MatrixXd::Identity(state_dim_, state_dim_);
 }
 
 /**
- * 作用：线性预测。输入：F、Q。输出：Fx。
+ * 作用：写入初值。输入：x/P。输出：is_initialized=true。
  */
-Eigen::VectorXd ExtendedKalmanFilter::predict(const Eigen::MatrixXd& F, const Eigen::MatrixXd& Q) {
-    return predict(F, Q, [&](const Eigen::VectorXd& x_in) { return F * x_in; });
+void EKFCore::init(const EKFCore::State& init_state) {
+    state_ = init_state;
+    is_initialized_ = true;
 }
 
 /**
- * 作用：x←f(x)，P←FPFᵀ+Q。输入：F、Q、f。输出：预测状态。
+ * 作用：x←f(x,dt)，P←F P Fᵀ + Q(dt)。输入：dt。输出：预测后的 state_。
  */
-Eigen::VectorXd ExtendedKalmanFilter::predict(const Eigen::MatrixXd& F, const Eigen::MatrixXd& Q,
-                                              const VectorFunc& f) {
-    P = F * P * F.transpose() + Q;
-    x = f(x);
-    return x;
+void EKFCore::predict(double dt) {
+    if (!is_initialized_)
+        throw std::runtime_error("EKFCore::predict: not initialized.");
+    const Eigen::MatrixXd F = process_jacobian_(state_.x, dt);  // ∂f/∂x
+    state_.x = process_func_(state_.x, dt);                     // 匀速+匀角速（由模型决定谁积 z）
+    const Eigen::MatrixXd Q = process_noise_func_ ? process_noise_func_(dt) : Q_;
+    state_.P = F * state_.P * F.transpose() + Q;
 }
 
 /**
- * 作用：线性 h(x)=Hx 的更新。输入：z、H、R、z_subtract。输出：后验 x。
+ * 作用：标准 Kalman 增益。输入：P、H、R。输出：K。
  */
-Eigen::VectorXd ExtendedKalmanFilter::update(const Eigen::VectorXd& z, const Eigen::MatrixXd& H,
-                                             const Eigen::MatrixXd& R, VectorSub z_subtract) {
-    return update(
-        z, H, R, [&](const Eigen::VectorXd& x_in) { return H * x_in; }, std::move(z_subtract));
+Eigen::MatrixXd EKFCore::computeKalmanGain(const Eigen::MatrixXd& P, const Eigen::MatrixXd& H,
+                                           const Eigen::MatrixXd& R) const {
+    const Eigen::MatrixXd S = H * P * H.transpose() + R;
+    return P * H.transpose() * S.inverse();
 }
 
 /**
- * 作用：K=PHᵀ(HPHᵀ+R)⁻¹，x←x⊕K(z-h(x))，P 用 Joseph 式。
- * 输入：z 为量测；h 为非线性量测；角度残差必须走 z_subtract。
- * 输出：后验 x；NIS/NEES 写入 data，供跟踪器按窗口失败次数重置。
+ * 作用：逐相位 evaluateMeasurement，NLL 最小者胜。
+ * 输入：z、相位表、参考相位、R、可选只比两相。输出：PhaseMatch。
  */
-Eigen::VectorXd ExtendedKalmanFilter::update(const Eigen::VectorXd& z, const Eigen::MatrixXd& H,
-                                             const Eigen::MatrixXd& R, const VectorFunc& h,
-                                             VectorSub z_subtract) {
-    const Eigen::VectorXd x_prior = x;
-    const Eigen::VectorXd y = z_subtract(z, h(x));  // 先验残差，角度已折 ±π
-    const Eigen::MatrixXd S_prior = H * P * H.transpose() + R;
-    last_innov_nis = y.transpose() * S_prior.inverse() * y;
-    data["innov_nis"] = last_innov_nis;
+EKFCore::PhaseMatch EKFCore::selectBestPhase(const Eigen::VectorXd& z,
+                                             const std::vector<double>& phase_offsets,
+                                             int reference_phase_idx,
+                                             const Eigen::MatrixXd& measurement_noise,
+                                             int candidate_phase) {
+    const int phase_count = static_cast<int>(phase_offsets.size());
+    double best_nll = std::numeric_limits<double>::max();
+    int best_phase_idx = reference_phase_idx >= 0 ? reference_phase_idx : 0;
+    int best_phase_distance = 0;
 
-    // 飞点：新息过大则抬 R 再算 K，这一帧几乎不改速度；真机动走下一帧自适应 Q。
-    Eigen::MatrixXd R_use = R;
-    if (total_count_ >= 2 && last_innov_nis > kOutlierInnovNis)
-        R_use = R * (last_innov_nis / kOutlierInnovNis);
-
-    Eigen::MatrixXd K = P * H.transpose() * (H * P * H.transpose() + R_use).inverse();
-
-    // Joseph：P=(I-KH)P(I-KH)ᵀ+KRKᵀ，比 (I-KH)P 更能保持对称正定（同济/rlabbe）。
-    P = (I_ - K * H) * P * (I_ - K * H).transpose() + K * R_use * K.transpose();
-    x = x_add_(x, K * y);
-
-    const Eigen::VectorXd residual = z_subtract(z, h(x));
-    Eigen::MatrixXd S = H * P * H.transpose() + R;
-    const double nis = residual.transpose() * S.inverse() * residual;
-    const double nees = (x - x_prior).transpose() * P.inverse() * (x - x_prior);
-
-    if (nis > kNisThreshold) {
-        ++nis_count_;
-        data["nis_fail"] = 1.0;
+    for (int idx = 0; idx < phase_count; ++idx) {
+        if (candidate_phase >= 0 && idx != reference_phase_idx && idx != candidate_phase)
+            continue;
+        const MeasurementEvaluation evaluation =
+            evaluateMeasurement(z, state_.x, idx, measurement_noise);  // 该相位的 NIS/NLL
+        int phase_distance = 0;
+        if (reference_phase_idx >= 0) {
+            const int phase_diff = std::abs(idx - reference_phase_idx);
+            phase_distance = std::min(phase_diff, phase_count - phase_diff);
+        }
+        if (evaluation.nll < best_nll) {
+            best_nll = evaluation.nll;
+            best_phase_idx = idx;
+            best_phase_distance = phase_distance;
+        }
     }
-    if (nees > kNeesThreshold) {
-        ++nees_count_;
-        data["nees_fail"] = 1.0;
+
+    PhaseMatch result;
+    result.phase_idx = best_phase_idx;
+    result.nll = best_nll;
+    result.phase_distance = best_phase_distance;
+    if (phase_count == 4 && reference_phase_idx >= 0 && best_phase_idx != reference_phase_idx) {
+        // 四板圆周：0/2 一对、1/3 一对，换对才叫 change（要切 z/r）
+        result.change = ((best_phase_idx % 2) != (reference_phase_idx % 2));
+    } else if (phase_count == 3 && reference_phase_idx >= 0) {
+        result.change = (best_phase_idx != reference_phase_idx);
     }
-    ++total_count_;
-    last_nis = nis;
+    return result;
+}
 
-    recent_nis_failures.push_back(nis > kNisThreshold ? 1 : 0);
-    if (recent_nis_failures.size() > window_size)
-        recent_nis_failures.pop_front();
-    const int recent_fail =
-        std::accumulate(recent_nis_failures.begin(), recent_nis_failures.end(), 0);
-    const double recent_rate =
-        static_cast<double>(recent_fail) / static_cast<double>(recent_nis_failures.size());
+/**
+ * 作用：用默认 R_ 评价。输入：z、假设 x、相位。输出：evaluation。
+ */
+EKFCore::MeasurementEvaluation EKFCore::evaluateMeasurement(const Eigen::VectorXd& z,
+                                                            const Eigen::VectorXd& x_hypothesis,
+                                                            int phase_idx) {
+    return evaluateMeasurement(z, x_hypothesis, phase_idx, R_);
+}
 
-    data["residual_yaw"] = residual[0];
-    data["residual_pitch"] = residual[1];
-    data["residual_distance"] = residual[2];
-    data["residual_angle"] = residual[3];
-    data["nis"] = nis;
-    data["nees"] = nees;
-    data["recent_nis_failures"] = recent_rate;
-    return x;
+/**
+ * 作用：y=z-h(x)，yaw 折角；S=HPHᵀ+R 对称化后 LDLT 求 NIS 与 log|S|。
+ * 输入：z、x_hypothesis（H 在此线性化）、相位、R。输出：NIS=yᵀS⁻¹y，NLL=½(NIS+log|S|)。
+ */
+EKFCore::MeasurementEvaluation EKFCore::evaluateMeasurement(const Eigen::VectorXd& z,
+                                                            const Eigen::VectorXd& x_hypothesis,
+                                                            int phase_idx,
+                                                            const Eigen::MatrixXd& measurement_noise) {
+    MeasurementEvaluation evaluation;
+    evaluation.H = measurement_jacobian_(x_hypothesis, phase_idx);  // ∂h/∂x 在假设点
+    const Eigen::VectorXd z_pred = measurement_func_(x_hypothesis, phase_idx);
+    evaluation.y = z - z_pred;
+    if (evaluation.y.size() >= 4)
+        evaluation.y(3) = warp2Pi(evaluation.y(3));  // 只折装甲 yaw
+
+    if (measurement_noise.rows() != evaluation.y.size() ||
+        measurement_noise.cols() != evaluation.y.size() || !measurement_noise.allFinite())
+        return evaluation;
+
+    evaluation.R = measurement_noise;
+    evaluation.S = evaluation.H * state_.P * evaluation.H.transpose() + evaluation.R;
+    evaluation.S = 0.5 * (evaluation.S + evaluation.S.transpose());
+
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(evaluation.S);
+    if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
+        return evaluation;
+
+    const Eigen::VectorXd solved = ldlt.solve(evaluation.y);
+    if (ldlt.info() != Eigen::Success || !solved.allFinite())
+        return evaluation;
+
+    evaluation.nis = evaluation.y.dot(solved);
+    if (evaluation.nis < 0.0) {
+        evaluation.nis = std::numeric_limits<double>::max();
+        return evaluation;
+    }
+    const double log_det_s = ldlt.vectorD().array().log().sum();
+    evaluation.nll = 0.5 * (evaluation.nis + log_det_s);
+    return evaluation;
+}
+
+/**
+ * 作用：块对角拼 R、竖拼 H/y，再对联合新息算 NIS/NLL。
+ * 输入：各板 evaluation。输出：batch evaluation。
+ */
+EKFCore::MeasurementEvaluation EKFCore::evaluateBatch(
+    const std::vector<MeasurementEvaluation>& observations) {
+    MeasurementEvaluation evaluation;
+    if (observations.empty())
+        return evaluation;
+
+    int measurement_rows = 0;
+    for (const auto& observation : observations) {
+        const int rows = static_cast<int>(observation.y.size());
+        if (rows <= 0 || observation.H.rows() != rows || observation.H.cols() != state_dim_ ||
+            observation.R.rows() != rows || observation.R.cols() != rows ||
+            !observation.R.allFinite() || !observation.y.allFinite() || !observation.H.allFinite())
+            return evaluation;
+        measurement_rows += rows;
+    }
+
+    evaluation.H = Eigen::MatrixXd::Zero(measurement_rows, state_dim_);
+    evaluation.y = Eigen::VectorXd::Zero(measurement_rows);
+    evaluation.R = Eigen::MatrixXd::Zero(measurement_rows, measurement_rows);
+    int offset = 0;
+    for (const auto& observation : observations) {
+        const int rows = static_cast<int>(observation.y.size());
+        evaluation.H.middleRows(offset, rows) = observation.H;
+        evaluation.y.segment(offset, rows) = observation.y;
+        evaluation.R.block(offset, offset, rows, rows) = observation.R;
+        offset += rows;
+    }
+
+    evaluation.S = evaluation.H * state_.P * evaluation.H.transpose() + evaluation.R;
+    evaluation.S = 0.5 * (evaluation.S + evaluation.S.transpose());
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(evaluation.S);
+    if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
+        return evaluation;
+    const Eigen::VectorXd solved = ldlt.solve(evaluation.y);
+    if (ldlt.info() != Eigen::Success || !solved.allFinite())
+        return evaluation;
+    evaluation.nis = evaluation.y.dot(solved);
+    if (evaluation.nis < 0.0) {
+        evaluation.nis = std::numeric_limits<double>::max();
+        return evaluation;
+    }
+    const double log_det_s = ldlt.vectorD().array().log().sum();
+    evaluation.nll = 0.5 * (evaluation.nis + log_det_s);
+    return evaluation;
+}
+
+/**
+ * 作用：x←x+Ky，P←(I-KH)P(I-KH)ᵀ+KRKᵀ。输入：evaluation。输出：后验。
+ */
+void EKFCore::update(const MeasurementEvaluation& evaluation) {
+    if (!is_initialized_)
+        throw std::runtime_error("EKFCore::update: not initialized.");
+    const Eigen::MatrixXd& H = evaluation.H;
+    const Eigen::MatrixXd K = computeKalmanGain(state_.P, H, evaluation.R);  // 全维增益
+    state_.x = state_.x + K * evaluation.y;
+    const Eigen::MatrixXd A = I_ - K * H;
+    state_.P = A * state_.P * A.transpose() + K * evaluation.R * K.transpose();
+    state_.P = 0.5 * (state_.P + state_.P.transpose());
+}
+
+/**
+ * 作用：先把非 active 维从 P/H 里解耦，再 Joseph；写回后这些维只保留原方差。
+ * 输入：evaluation、active 下标。输出：后验。
+ */
+void EKFCore::updatePartial(const MeasurementEvaluation& evaluation,
+                            const std::vector<int>& active_indices) {
+    if (!is_initialized_)
+        throw std::runtime_error("EKFCore::updatePartial: not initialized.");
+    if (active_indices.empty())
+        return;
+
+    Eigen::MatrixXd H = evaluation.H;
+    Eigen::MatrixXd P_masked = state_.P;
+    std::vector<bool> active_mask(static_cast<std::size_t>(state_dim_), false);
+    for (const int idx : active_indices) {
+        if (idx >= 0 && idx < state_dim_)
+            active_mask[static_cast<std::size_t>(idx)] = true;
+    }
+    for (int i = 0; i < state_dim_; ++i) {
+        if (active_mask[static_cast<std::size_t>(i)])
+            continue;
+        const double var = P_masked(i, i);
+        P_masked.row(i).setZero();
+        P_masked.col(i).setZero();
+        P_masked(i, i) = var;
+        H.col(i).setZero();  // 非本对 z/r 不进增益
+    }
+
+    const Eigen::MatrixXd K = computeKalmanGain(P_masked, H, evaluation.R);
+    state_.x += K * evaluation.y;
+    const Eigen::MatrixXd A = I_ - K * H;
+    state_.P = A * P_masked * A.transpose() + K * evaluation.R * K.transpose();
+    for (int i = 0; i < state_dim_; ++i) {
+        if (active_mask[static_cast<std::size_t>(i)])
+            continue;
+        const double var = P_masked(i, i);
+        state_.P.row(i).setZero();
+        state_.P.col(i).setZero();
+        state_.P(i, i) = var;
+    }
+    state_.P = 0.5 * (state_.P + state_.P.transpose());
 }

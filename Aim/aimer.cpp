@@ -2,13 +2,14 @@
  * 注释契约：禁止删本文件注释；改选板规则、飞时迭代或绘制颜色时必须改注释。
  * 瞄准点：飞时内外推车心（kv·v）与当前板相位（kw·ω），再重力抬高；禁止改成飞时后重选正对板。
  * 车心连线连的是本帧最正对的预测板（facing_id），不是飞时相位 phase_id。
- * ω 箭头：正对板心，v=ω×(板心−车心)，ω 与车心旁文字同一 vyaw。
+ * ω 箭头：正对板心，v=ω×(板心−车心)，ω 与车心旁文字同一相机系 vyaw。
  * 每个函数须写清作用/输入/输出；调用处注明意图。
  */
 #include "aimer.h"
 
 #include "Detector/detector_config.h"
 
+#include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
 #include <opencv2/calib3d.hpp>
@@ -143,7 +144,7 @@ const char* stateName(VehicleTrackState s) {
 }  // namespace
 
 /**
- * 作用：YAML aim → 弹速/重力/迭代/v·ω 提前系数 + EKF 门槛。
+ * 作用：YAML aim → 弹速/重力/迭代/v·ω 提前系数 + lovod EKF 门槛。
  * 输入：path。输出：打开成功为 true。
  */
 bool Aimer::loadConfig(const std::string& path) {
@@ -156,34 +157,30 @@ bool Aimer::loadConfig(const std::string& path) {
     readYaml(n, "iterations", params_.ballistic.iterations);
     readYaml(n, "w_lead_scale", params_.w_lead_scale);  // 只缩放飞时 ω，缺键保持 1
     readYaml(n, "v_lead_scale", params_.v_lead_scale);  // 只缩放飞时 vx/vy/vz，缺键保持 1
-    tracker_.loadConfig(path);  // 同一节点里的半径/Q/状态机
+    tracker_.loadConfig(path);  // 同一节点里的半径/Q/状态机（lovod 对角 Q）
     return true;
 }
 
 /**
- * 作用：EKF 跟踪最近车；用 kv·v 与 kw·ω 把当前板推到飞时，再弹道抬高。
+ * 作用：lovod 跟踪像心最近车；用 kv·v 与 kw·ω 把当前板推到飞时，再弹道抬高。
  * 输入：装甲、dt。输出：瞄准结果。
  */
 AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
-    tracker_.step(armors, dt);  // 最近车 → 11 维后验（含 vx,vy,vz,ω）
+    tracker_.step(armors, dt);  // 选车 + 11/6 维后验
     AimTarget tgt;
     tgt.track_state = tracker_.state();
     tgt.vehicle_id = tracker_.trackedId();
     if (!tracker_.hasTarget())
         return tgt;
 
-    const auto plates_now = tracker_.armorXyza();
+    const auto plates_now = tracker_.armorXyza();  // 跟踪系圆周 → 相机系板心+yaw
     if (plates_now.empty())
         return tgt;
     tgt.hub_mm = tracker_.hubMm();
     tgt.hub_px = projectCamMm(tgt.hub_mm);
-    tgt.r_m = tracker_.ekf().x[8];                      // 0/2 半径 r，与 armorXyz 同一 x[8]
-    tgt.rl_m = tracker_.ekf().x[8] + tracker_.ekf().x[9];  // 1/3 半径 r+l，禁止另写半径
-    tgt.vx_mps = tracker_.ekf().x[1];
-    tgt.vy_mps = tracker_.ekf().x[3];
-    tgt.vz_mps = tracker_.ekf().x[5];
-    tgt.vyaw_rad_s = tracker_.ekf().x[7];
-    tgt.nis = tracker_.ekf().last_nis;
+    tracker_.radii(tgt.r_m, tgt.rl_m);  // 当前相位半径 / 另一对，与 measureArmor 同一对状态
+    tracker_.cameraTwist(tgt.vx_mps, tgt.vy_mps, tgt.vz_mps, tgt.vyaw_rad_s);  // 跟踪系速度 → 相机
+    tgt.nis = tracker_.lastNis();
     tgt.phase_id = tracker_.lastPhaseId();
     const ArmorType plate_type = tracker_.trackedType();
     for (const auto& p : plates_now) {
@@ -207,17 +204,13 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
     double t_fly = ball.ok ? ball.fly_time_s : 0.0;
     const int n_iter = std::max(1, params_.ballistic.iterations);
     for (int k = 0; k < n_iter && t_fly > 1e-4; ++k) {
-        // 飞时内外推：车心 += kv·v·t，yaw += kw·ω·t（只改这份拷贝，EKF 不动）。
-        Eigen::VectorXd x0 = tracker_.ekf().x;
-        x0[1] *= params_.v_lead_scale;  // vxc
-        x0[3] *= params_.v_lead_scale;  // vyc
-        x0[5] *= params_.v_lead_scale;  // vzc
-        x0[7] *= params_.w_lead_scale;  // vyaw
-        const Eigen::VectorXd x = tracker_.extrapolate(x0, t_fly);
+        // 飞时内外推：只缩放跟踪系速度拷贝，EKF 不动。
+        const Eigen::VectorXd x =
+            tracker_.extrapolateLead(t_fly, params_.v_lead_scale, params_.w_lead_scale);
         const auto future = tracker_.armorXyza(&x);
         if (future.empty())
             break;
-        phase = pickLeadPlate(future, tracker_.lastPhaseId(), x0[7]);
+        phase = pickLeadPlate(future, tracker_.lastPhaseId(), tgt.vyaw_rad_s * params_.w_lead_scale);
         shot = xyzaToMm(future[static_cast<std::size_t>(phase)]);
         ball = solveBallistic(shot, params_.ballistic);
         if (!ball.ok)
@@ -239,7 +232,7 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
 
 /**
  * 作用：青圈车心、四周预测板色块、橙十字弹道点、车心速度与半径文字；读 AimTarget，不另算 v/ω/r。
- * 板矩形读 plate_quads（与 PnP 同物点）；k 画在 v/ω 旁，与飞时系数同一字段；r/r+l 读 r_m/rl_m。
+ * 板矩形读 plate_quads（与 PnP 同物点）；k 画在 v/ω 旁，与飞时系数同一字段；r1/r2 读 r_m/rl_m。
  * hub 开时画车心→plate_px[facing_id]（本帧正对板板心），以及该板心→omega_tip_px 的 ω 切向箭头。
  * 连线/箭头读 AimTarget 已有像素与 vyaw，不另算圆周或角速度。
  * 输入：BGR 图、update 结果、开关。输出：无。
@@ -251,7 +244,7 @@ void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) 
         cv::circle(img, tgt.hub_px, 6, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
     if (flags.vel && tgt.hub_px.x >= 0.f) {
         // 线速度：旋转中心 3D 速率；xz 为水平面（相机 X 右 Z 前）。角速度读 EKF vyaw；kv/kw 为飞时系数。
-        // 下一行 r / r+l 读 AimTarget::r_m / rl_m，与圆周 0/2、1/3 半径同一对状态。
+        // 下一行 r1 / r2 读 AimTarget::r_m / rl_m，与圆周当前相位、另一对半径同一对状态。
         const double v_lin = std::hypot(tgt.vx_mps, tgt.vy_mps, tgt.vz_mps);
         const double v_xz = std::hypot(tgt.vx_mps, tgt.vz_mps);
         const double w_deg = tgt.vyaw_rad_s * 180.0 / kPi;
@@ -265,8 +258,8 @@ void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) 
                                params_.w_lead_scale),
                     cv::Point(c.x + 10, c.y + 30), cv::FONT_HERSHEY_PLAIN, 0.95, cyan, 1,
                     cv::LINE_AA);
-        // r、r+l：与 EKF 圆周同一对量，vel 开关一起显示
-        cv::putText(img, cv::format("r:%.3fm r+l:%.3fm", tgt.r_m, tgt.rl_m),
+        // r1、r2：与 EKF 圆周同一对量，vel 开关一起显示
+        cv::putText(img, cv::format("r1:%.3fm r2:%.3fm", tgt.r_m, tgt.rl_m),
                     cv::Point(c.x + 10, c.y + 44), cv::FONT_HERSHEY_PLAIN, 0.95, cyan, 1,
                     cv::LINE_AA);
     }

@@ -10,16 +10,16 @@
 #include <vector>
 
 /**
- * 注释契约：本文件说明怎么用整车 EKF 推预瞄点。禁止删注释；改选板、飞时迭代或绘制时必须改注释。
+ * 注释契约：本文件说明怎么用 lovod 整车 EKF 推预瞄点。禁止删注释；改选板、飞时迭代或绘制时必须改注释。
  * 检测板心/法线读 ArmorBoard；车心/四板读 VehicleTracker 的同一状态；弹道读 solveBallistic。
  * 禁止显示时另写落差或圆周公式。每个函数须写清作用、输入、输出。
  *
- * 锁定距离最近的一辆车（VehicleTracker）。飞时内用 kv·v 把车心推走、
+ * 选车对齐 lovod process_node：优先像心最近，已锁则粘滞 id。飞时内用 kv·v 把车心推走、
  * 用 kw·ω 把当前相位的板转过去（同一块板超前，小陀螺时准星左右摆），
- * 转出可打锥面再沿缩放后的 ω 切下一块；最后再做重力抬高。
+ * 转出可打锥面再沿缩放后的 ω 切下一块；最后再做重力抬高（弹道在 Aim，lovod 跟踪包里没有）。
  * kv/kw 只乘飞时用的速度拷贝，不改 EKF 状态。
  * overlay：车心青圈连到本帧最正对相机的那块预测板板心（facing_id），不连飞时相位。
- * 正对板心画切向箭头：v=ω×(板心−车心)，ω 读 EKF vyaw；长度∝|ω|，方向=该板因自旋的移动方向。
+ * 正对板心画切向箭头：v=ω×(板心−车心)，ω 读相机系 vyaw；长度∝|ω|，方向=该板因自旋的移动方向。
  */
 struct AimParams {
     BallisticParams ballistic;
@@ -34,7 +34,7 @@ struct AimDrawFlags {
     bool plates = true;  // 半透明色块：EKF 预测的 n 块板面（与 PnP 同尺寸）
     bool aim = true;     // 橙十字：弹道瞄准点
     bool hud = true;     // 文字：id/状态/飞时
-    bool vel = true;     // 车心旁：|v|/ω 以及 r、r+l，读 EKF vx/vy/vz/vyaw 与 x[8]、x[8]+x[9]
+    bool vel = true;     // 车心旁：|v|/ω 以及 r1、r2，读相机系速度与 Tracker 当前/另一对半径
 };
 
 struct AimTarget {
@@ -44,12 +44,12 @@ struct AimTarget {
     double dist_m = -1.0;
     double fly_time_s = 0.0;
     double nis = 0.0;
-    double r_m = 0.0;          // EKF x[8]：相位 0/2 半径（米），与圆周同一字段
-    double rl_m = 0.0;         // EKF x[8]+x[9]：相位 1/3 半径 r+l（米），禁止另算
-    double vyaw_rad_s = 0.0;  // EKF 自旋 ω（绕竖直，rad/s）
-    double vx_mps = 0.0;      // EKF vxc，相机 X（右）
-    double vy_mps = 0.0;      // EKF vyc，相机 Y（下）
-    double vz_mps = 0.0;      // EKF vzc，相机 Z（前）
+    double r_m = 0.0;          // 当前相位半径 r1 或 r2（米），与圆周同一字段
+    double rl_m = 0.0;         // 另一对半径（米），禁止另算
+    double vyaw_rad_s = 0.0;  // 相机系自旋 ω（绕竖直，rad/s），由跟踪系 vyaw 取反
+    double vx_mps = 0.0;      // 相机 X（右）
+    double vy_mps = 0.0;      // 相机 Y（下）
+    double vz_mps = 0.0;      // 相机 Z（前）
     int phase_id = 0;      // 锁定超前的相位（飞时后，给橙十字）
     int facing_id = 0;     // 本帧最正对相机的预测板下标（min |板yaw−视线yaw|），给车心连线
     cv::Point3d hub_mm;
@@ -81,7 +81,7 @@ public:
     const VehicleTracker& tracker() const { return tracker_; }
 
     /**
-     * 作用：丢掉当前车。输入：无。输出：下一帧重新选最近车。同号同色 r/l/h 缓存保留。
+     * 作用：丢掉当前车。输入：无。输出：下一帧重新按像心选车。
      */
     void reset() { tracker_.reset(); }
 
@@ -94,7 +94,7 @@ public:
 
     /**
      * 作用：把车心/预测板矩形/瞄准点/车心速度与半径画到图上，读 AimTarget 已有量，不另算 EKF。
-     * 预测板四角读 plate_quads（与 PnP 同物点）；v/ω 旁的 kv、kw 读 params_；r/r+l 读 r_m/rl_m。
+     * 预测板四角读 plate_quads（与 PnP 同物点）；v/ω 旁的 kv、kw 读 params_；r1/r2 读 r_m/rl_m。
      * hub 开时再画车心→plate_px[facing_id] 连线，以及该板心→omega_tip_px 的 ω 切向箭头。
      * 正对板用 facingErr 已写入的下标；箭头读 vyaw 与圆周同一套板心，不另算 ω。
      * 输入：img 为 BGR；tgt 为 update 结果；flags 为各开关。ok=false 时不画。

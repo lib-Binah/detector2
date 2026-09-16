@@ -1,6 +1,6 @@
 /**
  * @file aim_test.cpp
- * @brief 装甲检测 + 同济整车 EKF + 弹道预瞄的播放调试（不改 armor_test）
+ * @brief 装甲检测 + lovod 整车 EKF + 弹道预瞄的播放调试（不改 armor_test）
  *
  * 注释契约：禁止随意删除本文件注释；改窗口、进度条或快捷键时必须改注释。
  * 画面上的车心/四板/瞄准点必须读 AimTarget 已有量；法线读 ArmorBoard::normal_cam。
@@ -9,7 +9,7 @@
  * 两个窗口：
  *   displayimg   原图 + 可选灯条/装甲/距离/法线/车心/速度/预测板/预瞄；顶栏 FPS；只留 frame 进度条
  *   aim vis      0/1 进度条：light / armor / dist / nml / hub / vel / plates / aim / hud / txt
- *                       nml 默认关；dist 读 ArmorBoard::dist_m；vel 读 EKF 车心 v、ω、r 与 r+l
+ *                       nml 默认关；dist 读 ArmorBoard::dist_m；vel 读 EKF 车心 v、ω、r1 与 r2
  *                       plates 为预测板色块（与 PnP 同尺寸）；hub 开时青线连车心到正对预测板，
  *                       并在该板心画 ω 切向箭头（读 EKF vyaw）
  *                       txt=0 时不画画面上的字
@@ -189,7 +189,7 @@ Mat makeVisLegend() {
             0.42, Scalar(255, 0, 255), kFontThick, LINE_AA);
     putText(panel, "hub=cyan  center, line, omega arrow on facing plate", Point(8, 110), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(255, 255, 0), kFontThick, LINE_AA);
-    putText(panel, "vel=hub v/w and r, r+l  (EKF vx..vyaw, x[8], x[8]+x[9])", Point(8, 132),
+    putText(panel, "vel=hub v/w and r1, r2  (camera twist, current/other radius)", Point(8, 132),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(255, 255, 0), kFontThick, LINE_AA);
     putText(panel, "plates=fill  EKF armor quads (PnP size, 4 colors)", Point(8, 154), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(0, 220, 0), kFontThick, LINE_AA);
@@ -211,7 +211,7 @@ Mat makeVisLegend() {
 Mat makeDisplayCanvas(const Mat& vis, double fps) {
     Mat canvas(vis.rows + kHudH, vis.cols, CV_8UC3, Scalar(28, 28, 28));
     vis.copyTo(canvas(Rect(0, kHudH, vis.cols, vis.rows)));
-    putText(canvas, cv::format("FPS:%.1f  aim_test  nearest-vehicle EKF", fps), Point(8, 24),
+    putText(canvas, cv::format("FPS:%.1f  aim_test  lovod-vehicle EKF", fps), Point(8, 24),
             FONT_HERSHEY_SIMPLEX, 0.55, Scalar(0, 200, 100), kFontThick, LINE_AA);
     return canvas;
 }
@@ -340,7 +340,7 @@ int main(int argc, char** argv) {
     };
 
     auto runAim = [&](double dt) {
-        aim_tgt = aimer.update(armors, dt);  // 最近车 EKF + 弹道
+        aim_tgt = aimer.update(armors, dt);  // lovod EKF + 弹道
     };
 
     auto grabAt = [&](int idx) {

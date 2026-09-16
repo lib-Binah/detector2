@@ -2,84 +2,151 @@
 #define AIM_EKF_H
 
 #include <Eigen/Dense>
-#include <deque>
 #include <functional>
-#include <map>
+#include <limits>
+#include <vector>
 
 /**
- * 注释契约：本文件说明同济式 EKF 为什么这样更新。禁止删注释；改 Joseph 式、
- * NIS 窗口或残差折角时必须改注释。每个函数须写清作用、输入、输出。
+ * 注释契约：本文件说明 lovod EKFCore 为什么这样预测/选相/更新。禁止删注释；
+ * 改 Joseph 式、NLL 相位、部分更新或残差折角时必须改注释。
+ * 每个函数须写清作用、输入、输出。
  *
- * 通用扩展卡尔曼滤波（对齐 TongjiSuperPower/sp_vision_25 tools::ExtendedKalmanFilter）。
- * 过程/量测函数由整车模型注入；本类只做 x=f(x)、P=FPFᵀ+Q、Joseph 更新、NIS/NEES。
- * yaw 等角度维用 x_add / z_subtract 折到 ±π，禁止直接 a-b 把 359° 当成大残差。
- * NIS 门槛与同济源码一致为 0.711（他们按 4 维 χ² 0.95 标注，数值本身过严）。
- * last_innov_nis 是更新前的新息卡方（yᵀS⁻¹y，S=HPHᵀ+R），给下一帧放大/缩小 Q：
- * 机动时新息大 → Q 变大几帧内跟上 v/ω；飞点时新息过大则抬 R 不追这一帧。
+ * 通用扩展卡尔曼滤波（对齐 auto_aim_by_lovod/rm_target_tracker EKFCore）。
+ * 过程/量测由整车模型注入；本类只做 x=f(x,dt)、P=FPFᵀ+Q、按相位算新息、Joseph 更新。
+ * 量测是笛卡尔 (x,y,z,yaw)，yaw 残差折到 ±π，禁止直接 a-b 把 359° 当成大残差。
+ * 选相用高斯 NLL = ½(yᵀS⁻¹y + log|S|)，不是同济的 ypd+卡方窗。
+ * updatePartial 把非本对 z/r 从增益里摘掉，避免一块板改另一对半径/高度。
  */
-class ExtendedKalmanFilter {
+class EKFCore {
 public:
-    using VectorAdd = std::function<Eigen::VectorXd(const Eigen::VectorXd&, const Eigen::VectorXd&)>;
-    using VectorFunc = std::function<Eigen::VectorXd(const Eigen::VectorXd&)>;
-    using VectorSub = std::function<Eigen::VectorXd(const Eigen::VectorXd&, const Eigen::VectorXd&)>;
+    struct State {
+        State() = default;
+        /**
+         * 作用：按维数分配零均值、单位协方差。
+         * 输入：dim 为状态维。输出：x=0，P=I。
+         */
+        explicit State(int dim) {
+            x = Eigen::VectorXd::Zero(dim);
+            P = Eigen::MatrixXd::Identity(dim, dim);
+        }
+        Eigen::VectorXd x;
+        Eigen::MatrixXd P;
+    };
 
-    Eigen::VectorXd x;
-    Eigen::MatrixXd P;
-    std::map<std::string, double> data;  // 同济：残差、nis/nees、窗口失败率
-    std::deque<int> recent_nis_failures{0};
-    std::size_t window_size = 100;
-    double last_nis = 0.0;
-    double last_innov_nis = 0.0;  // 更新前新息卡方；自适应 Q 读这个，不要读后验 last_nis
+    struct PhaseMatch {
+        int phase_idx{-1};
+        double nll{std::numeric_limits<double>::max()};
+        int phase_distance{0};
+        bool change{false};  // 四板：奇偶对换；三板：相位下标变了
+    };
 
-    ExtendedKalmanFilter() = default;
+    struct MeasurementEvaluation {
+        Eigen::MatrixXd H;
+        Eigen::VectorXd y;
+        Eigen::MatrixXd R;
+        Eigen::MatrixXd S;
+        double nis{std::numeric_limits<double>::max()};
+        double nll{std::numeric_limits<double>::max()};
+    };
 
-    /**
-     * 作用：用初值均值/协方差构造滤波器。
-     * 输入：x0 为状态；P0 为协方差；x_add 为状态加法（默认向量加，角度维可折 ±π）。
-     * 输出：x/P 已写入；尚未 predict。
-     */
-    ExtendedKalmanFilter(const Eigen::VectorXd& x0, const Eigen::MatrixXd& P0,
-                         VectorAdd x_add = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
-                             return a + b;
-                         });
+    using ProcessNoiseFunc = std::function<Eigen::MatrixXd(double)>;
+    using ProcessFunc = std::function<Eigen::VectorXd(const Eigen::VectorXd&, double)>;
+    using ProcessJacFunc = std::function<Eigen::MatrixXd(const Eigen::VectorXd&, double)>;
+    using MeasurementFunc = std::function<Eigen::VectorXd(const Eigen::VectorXd&, int)>;
+    using MeasurementJacFunc = std::function<Eigen::MatrixXd(const Eigen::VectorXd&, int)>;
 
-    /**
-     * 作用：线性过程 x←Fx，P←FPFᵀ+Q。
-     * 输入：F 为过程雅可比；Q 为过程噪声。输出：预测后的 x。
-     */
-    Eigen::VectorXd predict(const Eigen::MatrixXd& F, const Eigen::MatrixXd& Q);
-
-    /**
-     * 作用：非线性过程：x←f(x)，P 仍用 F 线性化传播。
-     * 输入：F、Q 同上；f 为非线性过程（同济用来对 yaw 做 limit_rad）。
-     * 输出：预测后的 x。
-     */
-    Eigen::VectorXd predict(const Eigen::MatrixXd& F, const Eigen::MatrixXd& Q, const VectorFunc& f);
-
-    /**
-     * 作用：线性量测更新。
-     * 输入：z 为量测；H、R 为雅可比和量测噪声；z_subtract 为残差（角度维折 ±π）。
-     * 输出：更新后的 x。
-     */
-    Eigen::VectorXd update(const Eigen::VectorXd& z, const Eigen::MatrixXd& H, const Eigen::MatrixXd& R,
-                           VectorSub z_subtract = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
-                               return a - b;
-                           });
+    EKFCore() = default;
 
     /**
-     * 作用：非线性量测更新（Joseph 形式保持 P 对称正定），并记新息/后验 NIS、NEES。
-     * 输入：z、H、R、h(x)、z_subtract。输出：更新后的 x；data["innov_nis"] 为更新前卡方。
-     * 新息大于 χ²_4≈16 时把 R 按比例抬高再算 K，PnP 飞点不把 v/ω 拽飞。
+     * 作用：注入过程/量测及其雅可比，以及对角 Q/R 底噪。
+     * 输入：五个函数指针都必须有效；Q 行数=状态维，R 行数=量测维。
+     * 输出：可 init；函数为空会抛异常。
      */
-    Eigen::VectorXd update(const Eigen::VectorXd& z, const Eigen::MatrixXd& H, const Eigen::MatrixXd& R,
-                           const VectorFunc& h, VectorSub z_subtract);
+    EKFCore(const ProcessNoiseFunc& process_noise_func, const ProcessFunc& process_func,
+            const MeasurementFunc& measurement_func, const ProcessJacFunc& process_jacobian,
+            const MeasurementJacFunc& measurement_jacobian, Eigen::MatrixXd Q, Eigen::MatrixXd R);
+
+    /**
+     * 作用：写入初值均值/协方差。输入：init_state。输出：之后允许 predict/update。
+     */
+    void init(const State& init_state);
+
+    /**
+     * 作用：非线性过程 x←f(x,dt)，P←FPFᵀ+Q(dt)。
+     * 输入：dt 秒。输出：改 state_；未 init 抛异常。
+     */
+    void predict(double dt);
+
+    /**
+     * 作用：K=PHᵀ(HPHᵀ+R)⁻¹。输入：当前 P、H、R。输出：增益。
+     */
+    Eigen::MatrixXd computeKalmanGain(const Eigen::MatrixXd& P, const Eigen::MatrixXd& H,
+                                      const Eigen::MatrixXd& R) const;
+
+    /**
+     * 作用：对每个相位算 NLL，挑最小的；四板时只在邻相/当前相里比（candidate≥0）。
+     * 输入：z 为量测；phase_offsets 为各相位相对车 yaw 的偏置；reference 为当前锁定相位；
+     *       measurement_noise 为该根的 R；candidate_phase&lt;0 表示搜全部相位。
+     * 输出：最佳相位、NLL、与参考相位的环距；change 表示换了对侧/换了前哨相位。
+     */
+    PhaseMatch selectBestPhase(const Eigen::VectorXd& z, const std::vector<double>& phase_offsets,
+                               int reference_phase_idx, const Eigen::MatrixXd& measurement_noise,
+                               int candidate_phase = -1);
+
+    /**
+     * 作用：在假设状态上算残差/NIS/NLL，S 仍用当前滤波器 P（lovod 原逻辑）。
+     * 输入：z、x_hypothesis、相位、R。输出：evaluation；S 不正定则 nis/nll 保持 max。
+     */
+    MeasurementEvaluation evaluateMeasurement(const Eigen::VectorXd& z,
+                                              const Eigen::VectorXd& x_hypothesis, int phase_idx);
+    MeasurementEvaluation evaluateMeasurement(const Eigen::VectorXd& z,
+                                              const Eigen::VectorXd& x_hypothesis, int phase_idx,
+                                              const Eigen::MatrixXd& measurement_noise);
+
+    /**
+     * 作用：把多块板的 (H,y,R) 拼成一块联合量测再算 NIS/NLL。
+     * 输入：observations 为已 evaluate 的各板。输出：堆叠后的 evaluation；任一块非法则 nis=max。
+     */
+    MeasurementEvaluation evaluateBatch(const std::vector<MeasurementEvaluation>& observations);
+
+    /**
+     * 作用：Joseph 更新，整维都吃增益。输入：evaluate 结果。输出：后验 x/P。
+     */
+    void update(const MeasurementEvaluation& evaluation);
+
+    /**
+     * 作用：只让 active_indices 那些状态吃增益，其余维保持方差、交叉项清零。
+     * 原理：本帧只看见一对装甲时，另一对的 z/r 不应被牵着走。
+     * 输入：evaluation、要更新的下标。输出：后验；空列表直接返回。
+     */
+    void updatePartial(const MeasurementEvaluation& evaluation,
+                       const std::vector<int>& active_indices);
+
+    bool isInitialized() const { return is_initialized_; }
+    const State& getState() const { return state_; }
+    State& getMutableState() { return state_; }
+    void setState(const State& state) { state_ = state; }
+    void setNoise(const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R) {
+        Q_ = Q;
+        R_ = R;
+    }
+    void setProcessNoiseFunc(const ProcessNoiseFunc& f) { process_noise_func_ = f; }
 
 private:
+    State state_;
+    ProcessNoiseFunc process_noise_func_;
+    ProcessFunc process_func_;
+    MeasurementFunc measurement_func_;
+    ProcessJacFunc process_jacobian_;
+    MeasurementJacFunc measurement_jacobian_;
+
     Eigen::MatrixXd I_;
-    VectorAdd x_add_;
-    int nees_count_ = 0;
-    int nis_count_ = 0;
-    int total_count_ = 0;
+    Eigen::MatrixXd Q_;
+    Eigen::MatrixXd R_;
+
+    int state_dim_{0};
+    int measurement_dim_{0};
+    bool is_initialized_{false};
 };
 
 #endif  // AIM_EKF_H
