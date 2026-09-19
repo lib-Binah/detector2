@@ -27,6 +27,7 @@
  * 无 IMU：跟踪系相对相机固定，视频里车心会跟着相机晃，这是无 TF 时的必然。
  * 四板 overlay 是 h(x) 推出来的刚体：车心/yaw 的卡尔曼增益不够大时，四块板会一起“粘住”慢爬。
  * lovod 的 Q×dt 是给 odom+IMU 的；本仓库无 TF，必须用 yaml 的 q_acc/q_alpha 白噪声，否则 P 收死。
+ * 相机系要贴 PnP：R 必须小、禁止用 NIS 丢掉唯一观测、P 对角加下限，否则跟踪会离开检测板。
  */
 struct VehicleEkfParams {
     double default_radius_m = 0.20;  // 锁车沿板法线推车心的 r；yaml default_radius_m
@@ -36,10 +37,9 @@ struct VehicleEkfParams {
     int tracking_threshold = 3;      // DETECTING 里连续匹配 > 该值才 TRACKING；yaml min_detect_count
     int lost_threshold = 10;         // TMP_LOST 超过该帧 → LOST；yaml max_temp_lost_count
     double root_min_variance = 1e-6;
-    // 锁俯仰后板 yaw 是朝向主量测。lovod 在 odom 里加 0.5 是为了压 IPPE 双根，
-    // 相机系加这么大会把四板转角冻住，默认只加一点。
-    double normal_yaw_extra_variance = 0.02;
-    double nis_gate = 20.0;  // 超过则抬 R 降权，不再整帧丢更新（丢更新四板会停住）
+    // 锁俯仰后板 yaw 就是朝向。再加方差等于不信法线，预测板会离开检测板。
+    double normal_yaw_extra_variance = 0.0;
+    double nis_gate = 20.0;  // 只给飞点抬 R；关联/更新不再用它丢观测
     double q_acc = 100.0;    // 平移加速度方差；yaml q_acc。相机系必须大，否则四板跟不上整车
     double q_alpha = 400.0;  // 角加速度方差；yaml q_alpha。决定四板转得快不快
     double q_adapt_ref = 4.0;
@@ -48,7 +48,7 @@ struct VehicleEkfParams {
     double vel_fade = 1.04;  // 每帧把 v/ω 的 P 略放大，防止收死后永远跟不上
     int bootstrap_confirm_frames = 5;
     double bootstrap_nll_margin = 10.0;
-    int phase_confirm_threshold = 2;  // 换相要连续这么多帧 NLL 才提交
+    int phase_confirm_threshold = 1;  // 看见换相立刻提交，刚体才跟当前板同一对 z/r
     bool enable_vx_accelerate = true;
     bool enable_vy_accelerate = false;
     bool enable_vyaw_accelerate = true;
@@ -61,7 +61,7 @@ struct VehicleEkfParams {
     double max_vy_area_ratio = 1.28;
     double z_drift_speed_threshold = 0.03;
     int z_count_threshold = 2;
-    double z_smooth_alpha = 0.35;
+    double z_smooth_alpha = 0.35;  // 只给 observeZSample 段均值；量测 z 不再替换，否则高度贴不住 PnP
     double vyaw_consistency_abs = 0.08;
     double vyaw_consistency_ratio = 0.35;
     double vyaw_base_gain = 0.01;
@@ -81,13 +81,13 @@ struct VehicleEkfParams {
     double smooth_alpha = 0.03;
     double quit_smooth_distance_threshold = 0.25;
     double model_vel_threshold = 0.15;
-    bool enable_smooth_vyaw = true;
+    bool enable_smooth_vyaw = false;  // ω 也跟 EKF 原值，避免箭头/飞时相位滞后
     double min_vyaw_smooth_vel = 2.0;
     int min_vyaw_smooth_sample = 3;
     int vyaw_smooth_window_size = 6;
     double max_vyaw_smooth_win_diff = 0.5;
     double max_vyaw_smooth_raw_diff = 0.7;
-    bool enable_smooth_outpost = true;
+    bool enable_smooth_outpost = false;  // 前哨车心同样贴 EKF，不另做发布低通
     double outpost_smooth_alpha = 0.005;
     double outpost_quit_smooth_distance_threshold = 0.4;
 };
@@ -390,11 +390,11 @@ private:
     double outpost_phase_duration_{2.0 * 3.14159265358979323846 / 3.0 / (0.8 * 3.14159265358979323846)};
     double direction_yaw_threshold_{1.0};
     double outpost_center_z_alpha_{0.15};
-    int phase_confirm_threshold_{2};
+    int phase_confirm_threshold_{1};
     int bootstrap_confirm_frames_{5};
     double bootstrap_nll_margin_{10.0};
     double root_min_variance_{1e-6};
-    double normal_yaw_extra_variance_{0.02};
+    double normal_yaw_extra_variance_{0.0};
     double nis_gate_{20.0};
     bool enable_vx_accelerate_{true};
     bool enable_vy_accelerate_{false};
@@ -463,6 +463,10 @@ private:
     void resetZAccumulator();
     void observeZSample(double meas_z, double stamp, int phase_idx, bool phase_changed);
     void updateZAccumulator(bool& active, int& counter, double drift_speed);
+    /**
+     * 作用：本帧高度量测。相机系直接用 PnP 的 z；段平滑会把观测换成旧均值，板会离检测。
+     * 输入：meas_z、相位（保留与对侧累加器同一接口）。输出：就是 meas_z。
+     */
     double getSmoothZ(double z, int phase_idx) const;
     void resetOutpostState();
     void finishOutpostZSegment();
@@ -491,9 +495,15 @@ private:
      */
     void fadeVelocityCov(Eigen::MatrixXd& P) const;
     /**
-     * 作用：NIS 超门限时按比例抬 R，这一帧仍更新但少改状态。输入：evaluation、门限。输出：改 R。
+     * 作用：只在 NIS 远超门限时抬 R，挡住飞点；普通机动必须全权吃量测。
+     * 输入：evaluation、χ² 门限。输出：可能改 ev.R。
      */
     static void inflateOutlierR(EKFCore::MeasurementEvaluation& ev, double gate);
+    /**
+     * 作用：位置/朝向/速度方差加下限。P 收死后 K≈0，预测板会离开 PnP。
+     * 输入：当前 P。输出：就地抬对角，保持对称。
+     */
+    void floorStateCov(Eigen::MatrixXd& P) const;
     std::vector<TrackedArmor> makeObservations(const std::vector<ArmorBoard>& armors) const;
     std::vector<TrackedArmor*> selectTargetArmors(std::vector<TrackedArmor>& armors);
     void refreshPublishSmooth(bool matched);

@@ -250,7 +250,7 @@ double VehicleTracker::processQScale() const {
     if (state_ == VehicleTrackState::TempLost)
         return params_.q_adapt_max;
     const double innov = last_nis_;
-    if (innov > 1e-9 && innov < 80.0 && params_.q_adapt_ref > 1e-6)
+    if (innov > 1e-9 && params_.q_adapt_ref > 1e-6)
         return std::clamp(innov / params_.q_adapt_ref, params_.q_adapt_min, params_.q_adapt_max);
     return 1.0;
 }
@@ -307,12 +307,49 @@ void VehicleTracker::fadeVelocityCov(Eigen::MatrixXd& P) const {
 }
 
 /**
- * 作用：飞点抬 R 而不是丢帧。输入：evaluation、χ² 门限。输出：改 ev.R。
+ * 作用：只挡飞点。门限×8 以内的新息必须全权更新，否则机动时跟踪会离开观测。
+ * 输入：evaluation、χ² 门限。输出：可能改 ev.R。
  */
 void VehicleTracker::inflateOutlierR(EKFCore::MeasurementEvaluation& ev, double gate) {
-    if (!std::isfinite(ev.nis) || gate < 1e-6 || ev.nis <= gate)
+    const double hard = gate * 8.0;
+    if (!std::isfinite(ev.nis) || hard < 1e-6 || ev.nis <= hard)
         return;
-    ev.R *= (ev.nis / gate);
+    ev.R *= (ev.nis / hard);
+}
+
+/**
+ * 作用：P 对角加下限，避免收死后增益≈0。输入：P。输出：就地改。
+ */
+void VehicleTracker::floorStateCov(Eigen::MatrixXd& P) const {
+    constexpr double pos_floor = 4e-4;   // σ≥2cm，板心每帧还能把车心拉开
+    constexpr double yaw_floor = 4e-4;   // σ≥1.1°
+    constexpr double vel_floor = 0.25;
+    constexpr double wyaw_floor = 0.25;
+    auto lift = [&P](int i, double lo) {
+        if (i >= 0 && i < P.rows() && i < P.cols())
+            P(i, i) = std::max(P(i, i), lo);
+    };
+    if (P.rows() == o_state_dim && P.cols() == o_state_dim) {
+        lift(o_xc, pos_floor);
+        lift(o_yc, pos_floor);
+        lift(o_zc, pos_floor);
+        lift(o_yaw, yaw_floor);
+        lift(o_vyaw, wyaw_floor);
+        P = 0.5 * (P + P.transpose());
+        return;
+    }
+    if (P.rows() < state_dim || P.cols() < state_dim)
+        return;
+    lift(xc, pos_floor);
+    lift(yc, pos_floor);
+    lift(z1, pos_floor);
+    lift(z2, pos_floor);
+    lift(yaw, yaw_floor);
+    lift(vx, vel_floor);
+    lift(vy, vel_floor);
+    lift(vz, vel_floor);
+    lift(vyaw, wyaw_floor);
+    P = 0.5 * (P + P.transpose());
 }
 
 /**
@@ -382,7 +419,8 @@ void VehicleTracker::buildNormalModel() {
     Q_ = Eigen::MatrixXd::Identity(state_dim, state_dim);
     for (std::size_t i = 0; i < q_diag.size(); ++i)
         Q_(static_cast<int>(i), static_cast<int>(i)) = q_diag[i];
-    const std::vector<double> r_diag = {0.0025, 0.0025, 0.02, 0.01};
+    // lovod odom 用 σ_xy≈5cm。相机系板心来自 PnP，σ 取 ~1cm 才能贴观测；yaml 若有 r 序列仍覆盖。
+    const std::vector<double> r_diag = {1e-4, 1e-4, 4e-4, 2.5e-3};
     R_ = Eigen::MatrixXd::Identity(4, 4);
     for (std::size_t i = 0; i < r_diag.size(); ++i)
         R_(static_cast<int>(i), static_cast<int>(i)) = r_diag[i];
@@ -433,7 +471,8 @@ void VehicleTracker::buildOutpostModel() {
     Q_outpost_ = Eigen::MatrixXd::Identity(o_state_dim, o_state_dim);
     for (std::size_t i = 0; i < q_diag.size(); ++i)
         Q_outpost_(static_cast<int>(i), static_cast<int>(i)) = q_diag[i];
-    const std::vector<double> r_diag = {0.8, 0.8, 0.4, 0.4};
+    // 前哨也要跟板心；lovod 0.8 是 odom 抖动，相机系会把三板从 PnP 上拉开。
+    const std::vector<double> r_diag = {1e-3, 1e-3, 4e-3, 1e-2};
     R_outpost_ = Eigen::MatrixXd::Identity(4, 4);
     for (std::size_t i = 0; i < r_diag.size(); ++i)
         R_outpost_(static_cast<int>(i), static_cast<int>(i)) = r_diag[i];
@@ -551,7 +590,7 @@ bool VehicleTracker::buildRootMeasurement(const PoseRoot& root, double yaw_refer
 }
 
 /**
- * 作用：在该板所有根×相位里挑 NIS 过门且 NLL 最小的。
+ * 作用：在该板所有根×相位里挑 NLL 最小的。滞后时 NIS 大也保留，否则观测进不了更新。
  * 输入：armor（会写 selected_root_idx）。输出：candidate；找不到 false。
  */
 bool VehicleTracker::selectNormalRoot(TrackedArmor& armor, RootPhaseCandidate& selected_candidate) const {
@@ -576,9 +615,8 @@ bool VehicleTracker::selectNormalRoot(TrackedArmor& armor, RootPhaseCandidate& s
             ekf_->evaluateMeasurement(root_candidate.measurement, target_state_.x,
                                       root_candidate.phase_match.phase_idx,
                                       root_candidate.measurement_noise);
-        if (!std::isfinite(root_candidate.phase_match.nll) || !std::isfinite(evaluation.nis) ||
-            evaluation.nis > nis_gate_ * 4.0)
-            continue;
+        if (!std::isfinite(root_candidate.phase_match.nll) || !std::isfinite(evaluation.nis))
+            continue;  // 只丢数值坏点；滞后时 NIS 大也要关联
         if (!found || root_candidate.phase_match.nll < selected_candidate.phase_match.nll) {
             selected_candidate = root_candidate;
             found = true;
@@ -618,9 +656,8 @@ bool VehicleTracker::selectOutpostRoot(const TrackedArmor& armor,
             ekf_->evaluateMeasurement(root_candidate.measurement, target_state_.x,
                                       root_candidate.phase_match.phase_idx,
                                       root_candidate.measurement_noise);
-        if (!std::isfinite(root_candidate.phase_match.nll) || !std::isfinite(evaluation.nis) ||
-            evaluation.nis > nis_gate_ * 4.0)
-            continue;
+        if (!std::isfinite(root_candidate.phase_match.nll) || !std::isfinite(evaluation.nis))
+            continue;  // 前哨同样不因 NIS 丢掉唯一板
         if (!found || root_candidate.phase_match.nll < selected_candidate.phase_match.nll) {
             selected_candidate = root_candidate;
             found = true;
@@ -630,8 +667,8 @@ bool VehicleTracker::selectOutpostRoot(const TrackedArmor& armor,
 }
 
 /**
- * 作用：同 id 最多两块板，各挑 NIS 过门的最佳相位；近相优先当 primary。
- * 输入：本帧指针。输出：association。
+ * 作用：同 id 最多两块板，各挑 NLL 最小相位；近相优先当 primary。
+ * 输入：本帧指针。输出：association。滞后时 NIS 大也关联，否则双板进不了更新。
  */
 bool VehicleTracker::associateNormalArmors(const std::vector<TrackedArmor*>& armors,
                                            ArmorAssociation& association) {
@@ -661,9 +698,8 @@ bool VehicleTracker::associateNormalArmors(const std::vector<TrackedArmor*>& arm
                 candidate.R = R;
                 candidate.evaluation =
                     ekf_->evaluateMeasurement(candidate.z, target_state_.x, phase_idx, candidate.R);
-                if (!std::isfinite(candidate.evaluation.nll) ||
-                    candidate.evaluation.nis > nis_gate_ * 4.0)
-                    continue;
+                if (!std::isfinite(candidate.evaluation.nll) || !std::isfinite(candidate.evaluation.nis))
+                    continue;  // 只丢数值坏点；滞后时 NIS 大也要关联
                 const int phase_diff = std::abs(phase_idx - confirmed_phase_idx_);
                 candidate.phase_match.phase_idx = phase_idx;
                 candidate.phase_match.phase_distance = std::min(phase_diff, 4 - phase_diff);
@@ -1163,11 +1199,12 @@ void VehicleTracker::updateZAccumulator(bool& active, int& counter, double drift
     }
 }
 
+/**
+ * 作用：本帧高度量测。输入：PnP 的 z、相位。输出：原样返回 z。
+ */
 double VehicleTracker::getSmoothZ(double z, int phase_idx) const {
-    const int pair_idx = isPair0Phase(phase_idx) ? 0 : 1;
-    return z_pair_states_[static_cast<std::size_t>(pair_idx)].active
-               ? z_pair_states_[static_cast<std::size_t>(pair_idx)].smooth_z
-               : z;
+    (void)phase_idx;
+    return z;  // 相机系贴 PnP 高度；段平滑会把量测换成旧均值，板会离检测
 }
 
 void VehicleTracker::observeZSample(double meas_z, double stamp, int phase_idx, bool phase_changed) {
@@ -1225,7 +1262,7 @@ void VehicleTracker::observeZSample(double meas_z, double stamp, int phase_idx, 
 void VehicleTracker::update(const std::vector<TrackedArmor*>& armors, double stamp) {
     if (bootstrap_running_ || isOutpostTarget() || armors.size() <= 1) {
         updateSingleFrame(armors.empty() ? nullptr : armors.front(), stamp);
-        return;
+            return;
     }
     const double dt = stamp - last_time_;
     const bool invalid_dt = !std::isfinite(dt) || dt <= 0.0 || dt > params_.max_dt_s;
@@ -1247,6 +1284,7 @@ void VehicleTracker::update(const std::vector<TrackedArmor*>& armors, double sta
     ekf_->predict(dt);
     target_state_ = ekf_->getState();
     fadeVelocityCov(target_state_.P);  // 防止 v/ω 的 P 收死，四板预测才能跟上加速
+    floorStateCov(target_state_.P);    // 位置/朝向下限，本帧增益才能贴 PnP
     ekf_->setState(target_state_);
     if (std::abs(target_state_.x(vyaw)) > high_spin_start_vyaw_)
         stop_evidence_armed_ = true;
@@ -1298,14 +1336,14 @@ void VehicleTracker::update(const std::vector<TrackedArmor*>& armors, double sta
         const int update_phase =
             (primary.phase_match.phase_idx >= 0) ? primary.phase_match.phase_idx : confirmed_phase_idx_;
         Eigen::Vector4d primary_z = primary.z;
-        primary_z(2) = getSmoothZ(primary_z(2), update_phase);
+        primary_z(2) = getSmoothZ(primary_z(2), update_phase);  // 本帧 PnP 高度，不再换成段均值
         EKFCore::MeasurementEvaluation primary_eval =
             ekf_->evaluateMeasurement(primary_z, target_state_.x, update_phase, primary.R);
         last_nis_ = primary_eval.nis;
         if (!std::isfinite(primary_eval.nis))
             allow_update = false;
         else
-            inflateOutlierR(primary_eval, nis_gate_);  // 超门限仍更新，只是少信这一帧
+            inflateOutlierR(primary_eval, nis_gate_);  // 只挡飞点（门限×8），普通机动全权更新
         bool use_support = false;
         EKFCore::MeasurementEvaluation batch_eval;
         if (allow_update && association.has_support) {
@@ -1345,6 +1383,7 @@ void VehicleTracker::update(const std::vector<TrackedArmor*>& armors, double sta
     }
     target_state_.x(r1) = std::clamp(target_state_.x(r1), 0.1, params_.max_r_m);
     target_state_.x(r2) = std::clamp(target_state_.x(r2), 0.1, params_.max_r_l_m);
+    floorStateCov(target_state_.P);
     ekf_->setState(target_state_);
     refreshPublishSmooth(matched);
 }
@@ -1396,6 +1435,7 @@ void VehicleTracker::updateSingleFrame(TrackedArmor* armor, double stamp) {
     const bool is_outpost = isOutpostTarget();
     if (!is_outpost) {
         fadeVelocityCov(target_state_.P);
+        floorStateCov(target_state_.P);
         decoupleInactiveCovariance(target_state_.P, confirmed_phase_idx_);
         ekf_->setState(target_state_);
     }
@@ -1428,7 +1468,7 @@ void VehicleTracker::updateSingleFrame(TrackedArmor* armor, double stamp) {
         auto evaluateAt = [&](int phase) {
             Eigen::Vector4d eval_meas = measurement;
             if (!is_outpost)
-                eval_meas(2) = getSmoothZ(measurement(2), phase);
+                eval_meas(2) = getSmoothZ(measurement(2), phase);  // 本帧 PnP 高度
             return ekf_->evaluateMeasurement(eval_meas, target_state_.x, phase, measurement_noise);
         };
         EKFCore::MeasurementEvaluation evaluation;
@@ -1489,12 +1529,10 @@ void VehicleTracker::updateSingleFrame(TrackedArmor* armor, double stamp) {
             if (!std::isfinite(evaluation.nis))
                 allow_update = false;
             else
-                inflateOutlierR(evaluation, nis_gate_);
+                inflateOutlierR(evaluation, nis_gate_);  // 只挡飞点（门限×8）
         }
         if (is_outpost && allow_update) {
-            const bool final_valid = std::isfinite(evaluation.nis) && std::isfinite(evaluation.nll) &&
-                                     evaluation.nis <= nis_gate_;
-            if (!final_valid) {
+            if (!std::isfinite(evaluation.nis) || !std::isfinite(evaluation.nll)) {
                 outpost_state_ = prev_outpost_state;
                 target_state_ = prev_target_state;
                 tracked_armor_ = prev_tracked_armor;
@@ -1503,6 +1541,7 @@ void VehicleTracker::updateSingleFrame(TrackedArmor* armor, double stamp) {
                 matched = false;
                 change = false;
             } else {
+                inflateOutlierR(evaluation, nis_gate_);  // 前哨也不因普通新息丢更新
                 ekf_->setState(target_state_);
                 if (change) {
                     last_phase_change_time_ = stamp;
@@ -1545,6 +1584,7 @@ void VehicleTracker::updateSingleFrame(TrackedArmor* armor, double stamp) {
         target_state_.x(r1) = std::clamp(target_state_.x(r1), 0.1, params_.max_r_m);
         target_state_.x(r2) = std::clamp(target_state_.x(r2), 0.1, params_.max_r_l_m);
     }
+    floorStateCov(target_state_.P);
     ekf_->setState(target_state_);
     refreshPublishSmooth(matched);
 }
@@ -1851,12 +1891,14 @@ std::vector<VehicleTracker::TrackedArmor> VehicleTracker::makeObservations(
         root.yaw = armorYawTrk(a.normal_cam);
         root.visual_covariance = Eigen::Matrix4d::Zero();
         const double e = std::max(a.reproj_error_px, 0.0);
-        const double pos_sigma = 0.005 * (1.0 + e);
+        // 重投影只说明 PnP 质量。σ 不能放到厘米以上，否则 R 太大跟踪贴不住板。
+        const double pos_sigma = std::clamp(0.004 * (1.0 + 0.1 * e), 0.003, 0.012);
+        const double yaw_sigma = std::clamp(0.03 * (1.0 + 0.05 * e), 0.02, 0.06);
         const double pos_var = std::max(root_min_variance_, pos_sigma * pos_sigma);
         root.visual_covariance(0, 0) = pos_var;
         root.visual_covariance(1, 1) = pos_var;
         root.visual_covariance(2, 2) = pos_var;
-        root.visual_covariance(3, 3) = std::max(root_min_variance_, 0.01);
+        root.visual_covariance(3, 3) = std::max(root_min_variance_, yaw_sigma * yaw_sigma);
         obs.pose_roots.push_back(root);
         out.push_back(std::move(obs));
     }
@@ -1959,6 +2001,7 @@ double VehicleTracker::smoothVyaw(double raw_vyaw, bool phase_change) {
 
 /**
  * 作用：lovod process_node 的 xy/ω 发布平滑，只改 published_*，不改 EKF。
+ * 相机系默认发布 EKF 原值；yaml enable_smooth_normal 才做车心低通。
  * 输入：本帧是否匹配。输出：published_xc/yc/vyaw。
  */
 void VehicleTracker::refreshPublishSmooth(bool matched) {
@@ -2011,24 +2054,10 @@ void VehicleTracker::refreshPublishSmooth(bool matched) {
     const double raw_y = target_state_.x(yc);
     const double raw_vyaw = target_state_.x(vyaw);
     published_vyaw_ = smoothVyaw(raw_vyaw, last_phase_change_);
-    const Eigen::Vector2d model_velocity(target_state_.x(vx), target_state_.x(vy));
-    if (std::abs(raw_vyaw) > 2.0) {
-        if (std::abs(model_velocity.x()) < params_.model_vel_threshold) {
-            enable_smooth_x_ = true;
-            quit_count_x_ = 0;
-        } else if (enable_smooth_x_ && ++quit_count_x_ > 3) {
-            enable_smooth_x_ = false;
-        }
-        if (std::abs(model_velocity.y()) < params_.model_vel_threshold) {
-            enable_smooth_y_ = true;
-            quit_count_y_ = 0;
-        } else if (enable_smooth_y_ && ++quit_count_y_ > 3) {
-            enable_smooth_y_ = false;
-        }
-    } else {
-        enable_smooth_x_ = enable_smooth_y_ = false;
-        quit_count_x_ = quit_count_y_ = 0;
-    }
+    // 相机系 overlay 跟 EKF 原值。lovod 自旋时单独平滑 x 或 y 会让车心离开预测板。
+    enable_smooth_x_ = false;
+    enable_smooth_y_ = false;
+    quit_count_x_ = quit_count_y_ = 0;
     const Eigen::Vector2d raw_position(raw_x, raw_y);
     const bool smooth_valid =
         smooth_pos_.allFinite() &&
@@ -2037,8 +2066,8 @@ void VehicleTracker::refreshPublishSmooth(bool matched) {
         smooth_pos_ = params_.smooth_alpha * raw_position + (1.0 - params_.smooth_alpha) * smooth_pos_;
     else
         smooth_pos_ = raw_position;
-    published_xc_ = enable_smooth_x_ ? smooth_pos_.x() : raw_x;
-    published_yc_ = enable_smooth_y_ ? smooth_pos_.y() : raw_y;
+    published_xc_ = params_.enable_smooth_normal ? smooth_pos_.x() : raw_x;
+    published_yc_ = params_.enable_smooth_normal ? smooth_pos_.y() : raw_y;
 }
 
 /**
