@@ -152,8 +152,9 @@ public:
     void reset();
 
     /**
-     * 作用：本帧装甲 → 选车（像心最近+id 粘滞）→ 预测/匹配/更新。
-     * 输入：armors 为已 PnP 的板；dt 为视频帧间隔秒（暂停/seek 应传 0 并先 reset）。
+     * 作用：本帧装甲 → 在给定列表里锁一个 number → 预测/匹配/更新。只维护这一辆。
+     * Aimer 按号分桶后各调一次，所以 3 号和 4 号不会进同一个本对象。
+     * 输入：armors 为已 PnP 的板（通常已是同一 number）；dt 为视频帧间隔秒（暂停/seek 应传 0 并先 reset）。
      * 输出：无；成功时 target_state_ 为后验。
      */
     void step(const std::vector<ArmorBoard>& armors, double dt);

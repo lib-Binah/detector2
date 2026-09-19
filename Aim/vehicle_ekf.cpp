@@ -1907,6 +1907,7 @@ std::vector<VehicleTracker::TrackedArmor> VehicleTracker::makeObservations(
 
 /**
  * 作用：像心最近优先；已跟踪则粘滞 id，除非新目标近过 id_switch_factor 倍。最多留两块同号板。
+ * Aimer 按号分桶后这里通常只有一个 number；混桶时仍只锁一辆，避免异号进同一 EKF。
  * 输入：本帧观测（可改 selected_root）。输出：指针，指向 frame_armors_ 里的元素。
  */
 std::vector<VehicleTracker::TrackedArmor*> VehicleTracker::selectTargetArmors(
@@ -2071,8 +2072,8 @@ void VehicleTracker::refreshPublishSmooth(bool matched) {
 }
 
 /**
- * 作用：选车并跟踪。Lost 时 init 最近像心目标；已锁则 update。
- * 输入：装甲、dt。输出：后验写在 target_state_。
+ * 作用：在给定板里锁一个 number 并跟踪。Lost 时 init 最近像心目标；已锁则 update。
+ * 输入：装甲（Aimer 通常已按号筛过）、dt。输出：后验写在 target_state_。
  */
 void VehicleTracker::step(const std::vector<ArmorBoard>& armors, double dt) {
     if (dt > 0.0)

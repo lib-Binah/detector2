@@ -5,6 +5,8 @@
 #include "ballistic.h"
 #include "vehicle_ekf.h"
 
+#include <map>
+#include <memory>
 #include <opencv2/core.hpp>
 #include <string>
 #include <vector>
@@ -14,12 +16,13 @@
  * 检测板心/法线读 ArmorBoard；车心/四板读 VehicleTracker 的同一状态；弹道读 solveBallistic。
  * 禁止显示时另写落差或圆周公式。每个函数须写清作用、输入、输出。
  *
- * 选车对齐 lovod process_node：优先像心最近，已锁则粘滞 id。飞时内用 kv·v 把车心推走、
- * 用 kw·ω 把当前相位的板转过去（同一块板超前，小陀螺时准星左右摆），
+ * 多车：按 ArmorBoard::number 分桶，每种号各一套 VehicleTracker / EKF，禁止把 3 号和 4 号并进同一滤波器。
+ * 同号最多两块侧面仍进该号的 11 维状态（primary+support）。单车内部仍是 lovod 圆周。
+ * 飞时内用 kv·v 把车心推走、用 kw·ω 把当前相位的板转过去（同一块板超前，小陀螺时准星左右摆），
  * 转出可打锥面再沿缩放后的 ω 切下一块；最后再做重力抬高（弹道在 Aim，lovod 跟踪包里没有）。
  * kv/kw 只乘飞时用的速度拷贝，不改 EKF 状态。
- * overlay：车心青圈连到本帧最正对相机的那块预测板板心（facing_id），不连飞时相位。
- * 正对板心画切向箭头：v=ω×(板心−车心)，ω 读相机系 vyaw；长度∝|ω|，方向=该板因自旋的移动方向。
+ * overlay：每辆车各画一套；车心青圈连到该车本帧最正对预测板（facing_id），不连飞时相位。
+ * 正对板心画切向箭头：v=ω×(板心−车心)，ω 读该车相机系 vyaw。
  */
 struct AimParams {
     BallisticParams ballistic;
@@ -77,34 +80,43 @@ public:
     bool loadConfig(const std::string& path);
 
     const AimParams& params() const { return params_; }
-    VehicleTracker& tracker() { return tracker_; }
-    const VehicleTracker& tracker() const { return tracker_; }
 
     /**
-     * 作用：丢掉当前车。输入：无。输出：下一帧重新按像心选车。
+     * 作用：丢掉所有车的 EKF。输入：无。输出：下一帧按本帧出现的 number 重新建跟踪。
      */
-    void reset() { tracker_.reset(); }
+    void reset();
 
     /**
-     * 作用：本帧装甲 → EKF → 用 kv·v 与 kw·ω 把当前板推到飞时 → 弹道预瞄点。
+     * 作用：按 number 分桶，每号各更新自己的 EKF，再各自算飞时弹道。
      * 输入：armors 已 PnP；dt 为视频帧间隔，≤0 只重算瞄准不推进时间。
-     * 输出：ok=false 表示没有锁定的车。
+     * 输出：当前未 Lost 的每辆车一条 AimTarget；没有车时为空。像心近的排前面。
      */
-    AimTarget update(const std::vector<ArmorBoard>& armors, double dt);
+    std::vector<AimTarget> update(const std::vector<ArmorBoard>& armors, double dt);
 
     /**
-     * 作用：把车心/预测板矩形/瞄准点/车心速度与半径画到图上，读 AimTarget 已有量，不另算 EKF。
+     * 作用：把一辆车的车心/预测板/瞄准点/速度半径画到图上，读该车 AimTarget，不另算 EKF。
      * 预测板四角读 plate_quads（与 PnP 同物点）；v/ω 旁的 kv、kw 读 params_；r1/r2 读 r_m/rl_m。
      * hub 开时再画车心→plate_px[facing_id] 连线，以及该板心→omega_tip_px 的 ω 切向箭头。
-     * 正对板用 facingErr 已写入的下标；箭头读 vyaw 与圆周同一套板心，不另算 ω。
-     * 输入：img 为 BGR；tgt 为 update 结果；flags 为各开关。ok=false 时不画。
+     * 输入：img 为 BGR；tgt 为该车 update 结果；flags 为各开关。Lost 且未瞄准则不画。
      * 输出：无。
      */
     void draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) const;
 
+    /**
+     * 作用：每辆车各画一套 overlay，读各自 AimTarget，不把异号板画进同一刚体。
+     * 输入：img、update 返回的列表、开关。输出：无。
+     */
+    void draw(cv::Mat& img, const std::vector<AimTarget>& tgts, const AimDrawFlags& flags) const;
+
 private:
+    /**
+     * 作用：从已更新的单车 EKF 写出一套 overlay/弹道。输入：该号 tracker。输出：AimTarget。
+     */
+    AimTarget makeTarget(VehicleTracker& tr) const;
+
     AimParams params_;
-    VehicleTracker tracker_;
+    std::string config_path_;  // 新建某号 EKF 时复用同一份 yaml
+    std::map<int, std::unique_ptr<VehicleTracker>> trackers_;
 };
 
 #endif  // AIM_AIMER_H

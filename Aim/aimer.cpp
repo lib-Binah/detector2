@@ -3,6 +3,7 @@
  * 瞄准点：飞时内外推车心（kv·v）与当前板相位（kw·ω），再重力抬高；禁止改成飞时后重选正对板。
  * 车心连线连的是本帧最正对的预测板（facing_id），不是飞时相位 phase_id。
  * ω 箭头：正对板心，v=ω×(板心−车心)，ω 与车心旁文字同一相机系 vyaw。
+ * 多车按 ArmorBoard::number 分桶，各开 EKF、各画一套 AimTarget；异号禁止合并。
  * 每个函数须写清作用/输入/输出；调用处注明意图。
  */
 #include "aimer.h"
@@ -12,6 +13,8 @@
 #include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <memory>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -157,39 +160,48 @@ bool Aimer::loadConfig(const std::string& path) {
     readYaml(n, "iterations", params_.ballistic.iterations);
     readYaml(n, "w_lead_scale", params_.w_lead_scale);  // 只缩放飞时 ω，缺键保持 1
     readYaml(n, "v_lead_scale", params_.v_lead_scale);  // 只缩放飞时 vx/vy/vz，缺键保持 1
-    tracker_.loadConfig(path);  // 同一节点里的半径/Q/状态机（lovod 对角 Q）
+    config_path_ = path;  // 之后新出现的号用同一份 yaml 建 EKF
+    for (auto& [id, tr] : trackers_) {
+        if (tr)
+            tr->loadConfig(path);  // 已有各号 EKF 同步同一份门槛
+    }
     return true;
 }
 
 /**
- * 作用：lovod 跟踪像心最近车；用 kv·v 与 kw·ω 把当前板推到飞时，再弹道抬高。
- * 输入：装甲、dt。输出：瞄准结果。
+ * 作用：丢掉所有号的跟踪。输入：无。输出：trackers_ 空。
  */
-AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
-    tracker_.step(armors, dt);  // 选车 + 11/6 维后验
+void Aimer::reset() {
+    trackers_.clear();
+}
+
+/**
+ * 作用：从单车后验写 overlay 与该车弹道。输入：该号 EKF。输出：AimTarget。
+ */
+AimTarget Aimer::makeTarget(VehicleTracker& tr) const {
     AimTarget tgt;
-    tgt.track_state = tracker_.state();
-    tgt.vehicle_id = tracker_.trackedId();
-    if (!tracker_.hasTarget())
+    tgt.track_state = tr.state();
+    tgt.vehicle_id = tr.trackedId();
+    if (!tr.hasTarget())
         return tgt;
 
-    const auto plates_now = tracker_.armorXyza();  // 跟踪系圆周 → 相机系板心+yaw
+    const auto plates_now = tr.armorXyza();  // 该号跟踪系圆周 → 相机系板心+yaw
     if (plates_now.empty())
         return tgt;
-    tgt.hub_mm = tracker_.hubMm();
+    tgt.hub_mm = tr.hubMm();
     tgt.hub_px = projectCamMm(tgt.hub_mm);
-    tracker_.radii(tgt.r_m, tgt.rl_m);  // 当前相位半径 / 另一对，与 measureArmor 同一对状态
-    tracker_.cameraTwist(tgt.vx_mps, tgt.vy_mps, tgt.vz_mps, tgt.vyaw_rad_s);  // 跟踪系速度 → 相机
-    tgt.nis = tracker_.lastNis();
-    tgt.phase_id = tracker_.lastPhaseId();
-    const ArmorType plate_type = tracker_.trackedType();
+    tr.radii(tgt.r_m, tgt.rl_m);  // 当前相位半径 / 另一对，与 measureArmor 同一对状态
+    tr.cameraTwist(tgt.vx_mps, tgt.vy_mps, tgt.vz_mps, tgt.vyaw_rad_s);  // 跟踪系速度 → 相机
+    tgt.nis = tr.lastNis();
+    tgt.phase_id = tr.lastPhaseId();
+    const ArmorType plate_type = tr.trackedType();
     for (const auto& p : plates_now) {
         const cv::Point3d mm = xyzaToMm(p);
         tgt.plate_px.push_back(projectCamMm(mm));
-        // 板心+yaw → 与 PnP 同尺寸四角，贴在车四周。
+        // 板心+yaw → 与 PnP 同尺寸四角，贴在该车四周。
         tgt.plate_quads.push_back(ArmorBoard::projectArmorQuad(mm, p[3], plate_type));
     }
-    tgt.facing_id = pickFacingPlate(plates_now);  // 本帧最正对相机的预测板，给车心连线
+    tgt.facing_id = pickFacingPlate(plates_now);  // 该车本帧最正对相机的预测板
     {
         const int fid = tgt.facing_id;
         if (fid >= 0 && fid < static_cast<int>(plates_now.size()))
@@ -204,13 +216,12 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
     double t_fly = ball.ok ? ball.fly_time_s : 0.0;
     const int n_iter = std::max(1, params_.ballistic.iterations);
     for (int k = 0; k < n_iter && t_fly > 1e-4; ++k) {
-        // 飞时内外推：只缩放跟踪系速度拷贝，EKF 不动。
-        const Eigen::VectorXd x =
-            tracker_.extrapolateLead(t_fly, params_.v_lead_scale, params_.w_lead_scale);
-        const auto future = tracker_.armorXyza(&x);
+        // 飞时内外推：只缩放该号跟踪系速度拷贝，EKF 不动。
+        const Eigen::VectorXd x = tr.extrapolateLead(t_fly, params_.v_lead_scale, params_.w_lead_scale);
+        const auto future = tr.armorXyza(&x);
         if (future.empty())
             break;
-        phase = pickLeadPlate(future, tracker_.lastPhaseId(), tgt.vyaw_rad_s * params_.w_lead_scale);
+        phase = pickLeadPlate(future, tr.lastPhaseId(), tgt.vyaw_rad_s * params_.w_lead_scale);
         shot = xyzaToMm(future[static_cast<std::size_t>(phase)]);
         ball = solveBallistic(shot, params_.ballistic);
         if (!ball.ok)
@@ -228,6 +239,64 @@ AimTarget Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
     tgt.aim_px = projectCamMm(ball.aim_cam_mm);
     tgt.ballistic = ball;
     return tgt;
+}
+
+/**
+ * 作用：按 number 分桶，每号各喂自己的 EKF；没看见的号走空列表让 TempLost。
+ * 输入：本帧装甲、dt。输出：未 Lost 的各车 AimTarget，按离像心近到远排。
+ */
+std::vector<AimTarget> Aimer::update(const std::vector<ArmorBoard>& armors, double dt) {
+    std::map<int, std::vector<ArmorBoard>> by_id;
+    for (const auto& a : armors) {
+        if (!a.pnp_ok || a.dist_m <= 0.0)
+            continue;
+        by_id[a.number].push_back(a);  // 同号进同一桶，异号分开
+    }
+    for (auto& [id, tr] : trackers_) {
+        if (!tr)
+            continue;
+        const auto it = by_id.find(id);
+        if (it != by_id.end())
+            tr->step(it->second, dt);  // 只喂该号的板
+        else
+            tr->step({}, dt);  // 本帧没看见：状态机走丢失
+    }
+    for (const auto& [id, boards] : by_id) {
+        if (trackers_.count(id) != 0)
+            continue;
+        auto tr = std::make_unique<VehicleTracker>();  // 堆上分配，避免 move 后 EKF 回调悬空 this
+        if (!config_path_.empty())
+            tr->loadConfig(config_path_);
+        tr->step(boards, dt);
+        trackers_.emplace(id, std::move(tr));
+    }
+    for (auto it = trackers_.begin(); it != trackers_.end();) {
+        if (!it->second || it->second->state() == VehicleTrackState::Lost)
+            it = trackers_.erase(it);
+        else
+            ++it;
+    }
+
+    std::vector<AimTarget> out;
+    out.reserve(trackers_.size());
+    for (auto& kv : trackers_) {
+        if (kv.second)
+            out.push_back(makeTarget(*kv.second));
+    }
+    const cv::Mat& K = ArmorBoard::cameraMatrix();
+    const double cx = (K.rows >= 3 && K.cols >= 3) ? K.at<double>(0, 2) : 0.0;
+    const double cy = (K.rows >= 3 && K.cols >= 3) ? K.at<double>(1, 2) : 0.0;
+    std::sort(out.begin(), out.end(), [cx, cy](const AimTarget& a, const AimTarget& b) {
+        auto d2 = [cx, cy](const AimTarget& t) {
+            if (t.hub_px.x < 0.f)
+                return 1e18;
+            const double dx = static_cast<double>(t.hub_px.x) - cx;
+            const double dy = static_cast<double>(t.hub_px.y) - cy;
+            return dx * dx + dy * dy;
+        };
+        return d2(a) < d2(b);
+    });
+    return out;
 }
 
 /**
@@ -351,4 +420,13 @@ void Aimer::draw(cv::Mat& img, const AimTarget& tgt, const AimDrawFlags& flags) 
         cv::putText(img, hud, cv::Point(c.x + 10, c.y - 8), cv::FONT_HERSHEY_PLAIN, 0.95,
                     cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
     }
+}
+
+/**
+ * 作用：每辆车各画一套，读各自 AimTarget；异号刚体不会画到一起。
+ * 输入：BGR、update 列表、开关。输出：无。
+ */
+void Aimer::draw(cv::Mat& img, const std::vector<AimTarget>& tgts, const AimDrawFlags& flags) const {
+    for (const auto& tgt : tgts)
+        draw(img, tgt, flags);  // 该车自己的车心/四板/瞄准点
 }

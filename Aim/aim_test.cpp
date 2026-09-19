@@ -3,11 +3,12 @@
  * @brief 装甲检测 + lovod 整车 EKF + 弹道预瞄的播放调试（不改 armor_test）
  *
  * 注释契约：禁止随意删除本文件注释；改窗口、进度条或快捷键时必须改注释。
- * 画面上的车心/四板/瞄准点必须读 AimTarget 已有量；法线读 ArmorBoard::normal_cam。
+ * 画面上的车心/四板/瞄准点必须读各车 AimTarget 已有量；法线读 ArmorBoard::normal_cam。
+ * 同帧多种 ArmorBoard::number 各一套 EKF，各自画 overlay，禁止把异号并进同一刚体。
  * 检测门槛只从 yaml 读，调灯条/配对请用 armor_test。每个函数须写清作用、输入、输出。
  *
  * 两个窗口：
- *   displayimg   原图 + 可选灯条/装甲/距离/法线/车心/速度/预测板/预瞄；顶栏 FPS；只留 frame 进度条
+ *   displayimg   原图 + 可选灯条/装甲/距离/法线/车心/速度/预测板/预瞄；顶栏 FPS 与本帧车辆数；只留 frame 进度条
  *   aim vis      0/1 进度条：light / armor / dist / nml / hub / vel / plates / aim / hud / txt
  *                       nml 默认关；dist 读 ArmorBoard::dist_m；vel 读 EKF 车心 v、ω、r1 与 r2
  *                       plates 为预测板色块（与 PnP 同尺寸）；hub 开时青线连车心到正对预测板，
@@ -60,7 +61,7 @@ int overlay_vel = 1;     // 车心线速度 |v|、角速度 ω，读 AimTarget �
 int overlay_plates = 1;  // EKF 预测板面色块（与 PnP 同尺寸四角）
 int overlay_aim = 1;     // 弹道预瞄十字（v、ω 飞时超前 + 重力）
 int overlay_hud = 1;     // 状态文字：id / tracking / 飞时
-int overlay_txt = 1;     // 总开关：0 不画画面文字（dist/vel/hud），几何 overlay 不受影响
+int overlay_txt = 0;     // 总开关：0 不画画面文字（dist/vel/hud），几何 overlay 不受影响
 
 /**
  * 作用：只在播出新帧时刷新 FPS。
@@ -178,7 +179,7 @@ void drawArmorDistances(Mat& img, const std::vector<ArmorBoard>& armors) {
  * 作用： vis 开关说明图。输入：无。输出：BGR 说明。
  */
 Mat makeVisLegend() {
-    Mat panel(266, 540, CV_8UC3, Scalar(28, 28, 28));
+    Mat panel(288, 540, CV_8UC3, Scalar(28, 28, 28));
     putText(panel, "0=hide  1=show   (displayimg)", Point(8, 22), FONT_HERSHEY_SIMPLEX, 0.42,
             Scalar(0, 200, 100), kFontThick, LINE_AA);
     putText(panel, "light / armor = detector boxes", Point(8, 44), FONT_HERSHEY_SIMPLEX, 0.42,
@@ -201,17 +202,20 @@ Mat makeVisLegend() {
             0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
     putText(panel, "detection params: yaml only (use armor_test)", Point(8, 242),
             FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
+    putText(panel, "multi-id: each ArmorBoard::number has its own EKF", Point(8, 264),
+            FONT_HERSHEY_SIMPLEX, 0.42, Scalar(180, 180, 180), kFontThick, LINE_AA);
     return panel;
 }
 
 /**
  * 作用：检测画面接到 FPS 顶栏下面。
- * 输入：vis、fps。输出：带顶栏的画布。
+ * 输入：vis、fps、n_cars（本帧 AimTarget 条数）。输出：带顶栏的画布。
  */
-Mat makeDisplayCanvas(const Mat& vis, double fps) {
+Mat makeDisplayCanvas(const Mat& vis, double fps, int n_cars) {
     Mat canvas(vis.rows + kHudH, vis.cols, CV_8UC3, Scalar(28, 28, 28));
     vis.copyTo(canvas(Rect(0, kHudH, vis.cols, vis.rows)));
-    putText(canvas, cv::format("FPS:%.1f  aim_test  lovod-vehicle EKF", fps), Point(8, 24),
+    // n_cars 读本帧 AimTarget 条数，与 Aimer 按 number 开的 EKF 套数同一来源。
+    putText(canvas, cv::format("FPS:%.1f  aim_test  cars:%d  multi-EKF", fps, n_cars), Point(8, 24),
             FONT_HERSHEY_SIMPLEX, 0.55, Scalar(0, 200, 100), kFontThick, LINE_AA);
     return canvas;
 }
@@ -311,7 +315,7 @@ int main(int argc, char** argv) {
     Mat bin;
     std::vector<Light> lights;
     std::vector<ArmorBoard> armors;
-    AimTarget aim_tgt;
+    std::vector<AimTarget> aim_tgts;
     bool is_show_fps = true;
     double fps = 0.0;
     FrameScrubber scrubber;
@@ -340,7 +344,7 @@ int main(int argc, char** argv) {
     };
 
     auto runAim = [&](double dt) {
-        aim_tgt = aimer.update(armors, dt);  // lovod EKF + 弹道
+        aim_tgts = aimer.update(armors, dt);  // 每号各一套 EKF + 弹道
     };
 
     auto grabAt = [&](int idx) {
@@ -403,9 +407,11 @@ int main(int argc, char** argv) {
         const AimDrawFlags flags{overlay_hub != 0, overlay_plates != 0, overlay_aim != 0,
                                  overlay_hud != 0 && overlay_txt != 0,
                                  overlay_vel != 0 && overlay_txt != 0};
-        aimer.draw(vis, aim_tgt, flags);  // 读 AimTarget 像素
+        aimer.draw(vis, aim_tgts, flags);  // 每辆车读自己的 AimTarget 像素
 
-        Mat shown = scaleTo1080(makeDisplayCanvas(vis, is_show_fps ? fps : 0.0), &display_scale,
+        Mat shown = scaleTo1080(makeDisplayCanvas(vis, is_show_fps ? fps : 0.0,
+                                                  static_cast<int>(aim_tgts.size())),
+                                &display_scale,
                                 kDisplayTrackbars);
         imshow(win_display, shown);
         imshow(win_vis, makeVisLegend());
