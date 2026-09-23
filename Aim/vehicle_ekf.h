@@ -428,8 +428,16 @@ private:
     bool last_phase_change_{false};
 
     std::unique_ptr<EKFCore> makeNormalEKF(const int& active_phase_idx) const;
+    /**
+     * 作用：写入普通目标 Q/R 并重建核。输入：无。输出：model=Normal，ekf_ 绑上 11 维 f/h。
+     */
     void buildNormalModel();
     void buildOutpostModel();
+    /**
+     * 作用：锁车。前哨走 6 维；普通车先试 IPPE 双根 bootstrap。
+     * 输入：选中的装甲指针（Lost 时 step 传来 selected.front()）；空指针直接返回。
+     * 输出：state=Detecting；主 EKF 或 bootstrap 假设已有初值。本函数不 predict。
+     */
     void init(TrackedArmor* armor);
     void initEKF(const TrackedArmor& armor);
     bool startNormalBootstrap(const TrackedArmor& armor);
@@ -505,7 +513,16 @@ private:
      * 输入：当前 P。输出：就地抬对角，保持对称。
      */
     void floorStateCov(Eigen::MatrixXd& P) const;
+    /**
+     * 作用：pnp_ok 板 → 跟踪系一根位姿（锁俯仰后只有一根，双根 bootstrap 自动跳过）。
+     * 输入：检测装甲。输出：观测列表，坏板已丢掉；step 写入 frame_armors_ 后再 selectTargetArmors。
+     */
     std::vector<TrackedArmor> makeObservations(const std::vector<ArmorBoard>& armors) const;
+    /**
+     * 作用：像心最近优先；已跟踪则粘滞 id，除非新目标近过 id_switch_factor 倍。最多留两块同号板。
+     * 输入：本帧观测（makeObservations 的结果，可改 selected_root）。
+     * 输出：0~2 个指针，指向传入容器里同号元素；空列表表示本帧无板。
+     */
     std::vector<TrackedArmor*> selectTargetArmors(std::vector<TrackedArmor>& armors);
     void refreshPublishSmooth(bool matched);
     void resetVyawSmooth();

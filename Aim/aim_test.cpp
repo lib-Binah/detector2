@@ -16,6 +16,7 @@
  *                       txt=0 时不画画面上的字
  *
  * 快捷键：空格暂停，a/d 或方向键逐帧，1 开关帧率，q/Esc 退出。Seek 会重置 EKF。
+ * 搜索 ★★★ 可跳到：灯条检测、装甲板检测、整车 EKF（main 里 grabAt/grabNext/runAim）。
  */
 #include <opencv2/opencv.hpp>
 #include <algorithm>
@@ -157,7 +158,9 @@ void processArmors(const Mat& raw, LightDetector& light_detector, ArmorDetector&
                    Mat& bin, std::vector<Light>& lights, std::vector<ArmorBoard>& armors) {
     current_frame = raw.clone();
     cvtColor(current_frame, current_gray, COLOR_BGR2GRAY);
+    // ★★★【灯条检测】★★★  唯一入口：BGR 原图 → lights；bin 是同源二值，给调试窗用。
     lights = light_detector.get_lights(current_frame, &bin);  // BGR → 灯条 + 同源二值
+    // ★★★【装甲板检测】★★★  唯一入口：灯条配对 + 数字 + 锁俯仰 PnP → armors（EKF 只吃这些板）。
     armors = armor_detector.get_armors(lights, current_frame);  // 配对/数字/锁俯仰 PnP
 }
 
@@ -337,65 +340,103 @@ int main(int argc, char** argv) {
     createTrackbar("hud", win_vis, &overlay_hud, 1);
     createTrackbar("txt", win_vis, &overlay_txt, 1);  // 0/1：画面文字总开关，几何仍画
 
+    // 下面四个小函数共用这些量：
+    //   shown_index  画面上正在看的帧号（0 起）
+    //   last_index   最后一帧号 = 总帧数-1
+    //   frame_dt     相邻两帧间隔秒 = 1/视频帧率，只给连续播放的 EKF 用
+    //   raw          刚从视频读出的 BGR 原图
+    //   lights/armors 本帧检测结果；aim_tgts 本帧各车瞄准结果
+    //   scrubber     进度条：want=想跳到哪一帧，seek=用户拖过了，syncing=程序自己改滑块时挡住回调
+    //   paused       true=停住不读下一帧，仍会重画 overlay
+    /**
+     * 作用：把进度条滑块拨到当前正在看的那一帧，避免滑块和画面差一帧。
+     * 输入：无（读 shown_index）。输出：无。
+     * 原理：setTrackbarPos 会触发 onFrameTrackbar；先把 syncing 置真，回调里直接 return，
+     *       否则程序会以为用户又拖了一次进度条，陷入反复跳帧。
+     */
     auto syncTrackbar = [&]() {
-        scrubber.syncing = true;
-        setTrackbarPos("frame", win_display, shown_index);
+        scrubber.syncing = true;  // 告诉回调：这次是程序自己改滑块，不是人手拖
+        setTrackbarPos("frame", win_display, shown_index);  // 滑块数字 = 当前帧号
         scrubber.syncing = false;
     };
 
+    /**
+     * 作用：用本帧检测到的装甲跑一遍瞄准：每号车各一套 EKF，再算弹道。
+     * 输入：dt 为这一帧相对上一帧过了多少秒。连续播放传 frame_dt；跳帧/seek 传 0（不让滤波当时间在走）。
+     * 输出：写入 aim_tgts。一条 AimTarget = 一辆未 Lost 的车（车心、四板、预瞄点）。
+     */
     auto runAim = [&](double dt) {
+        // ★★★【整车 EKF】★★★  main 里唯一调用：本帧 armors + dt → 每号各一套滤波 + 弹道。
+        //     真正 predict/update 在 Aimer::update → VehicleTracker::step（Aim/vehicle_ekf.cpp）。
         aim_tgts = aimer.update(armors, dt);  // 每号各一套 EKF + 弹道
     };
 
+    /**
+     * 作用：跳到指定帧（拖进度条、左右键逐帧）。时间不连续，所以 EKF 必须重锁。
+     * 输入：idx 为目标帧号（0 起）。输出：读到图返回 true；空帧返回 false。
+     */
     auto grabAt = [&](int idx) {
-        idx = std::clamp(idx, 0, last_index);
-        cap.set(CAP_PROP_POS_FRAMES, idx);
-        cap >> raw;
+        idx = std::clamp(idx, 0, last_index);  // 夹到合法范围，避免越界
+        cap.set(CAP_PROP_POS_FRAMES, idx);     // 告诉解码器：下一张读第 idx 帧
+        cap >> raw;                            // 读出 BGR 原图
         if (raw.empty())
             return false;
-        shown_index = idx;
-        processArmors(raw, light_detector, armor_detector, bin, lights, armors);
+        shown_index = idx;  // 画面上现在就是这一帧
+        // ★★★【灯条检测 + 装甲板检测】★★★  跳帧路径：原图 → lights / armors。
+        processArmors(raw, light_detector, armor_detector, bin, lights, armors);  // 原图 → 灯条 + 装甲
         aimer.reset();  // seek 后时间不连续，必须重锁车
-        runAim(0.0);
-        syncTrackbar();
+        // ★★★【整车 EKF】★★★  跳帧路径：dt=0，不按视频间隔预测，只在本帧初始化/显示。
+        runAim(0.0);    // dt=0：只在这一帧上初始化/显示，不按视频间隔去预测
+        syncTrackbar(); // 进度条跟上 shown_index
         return true;
     };
 
+    /**
+     * 作用：连续播放时读下一帧，用真实帧间隔去推 EKF。
+     * 输入：无。输出：读到图返回 true；视频结束空帧返回 false。
+     * 说明：OpenCV 读完一帧后，POS_FRAMES 已经指向「下一帧」的下标，所以当前帧号是 pos-1。
+     */
     auto grabNext = [&]() {
-        cap >> raw;
+        cap >> raw;  // 顺序读下一张 BGR
         if (raw.empty())
             return false;
-        const int pos = static_cast<int>(cap.get(CAP_PROP_POS_FRAMES));
-        shown_index = std::clamp(pos - 1, 0, last_index);
-        processArmors(raw, light_detector, armor_detector, bin, lights, armors);
-        runAim(frame_dt);
+        const int pos = static_cast<int>(cap.get(CAP_PROP_POS_FRAMES));  // 解码器眼里的「下一帧」下标
+        shown_index = std::clamp(pos - 1, 0, last_index);               // 刚读出来的才是当前帧
+        // ★★★【灯条检测 + 装甲板检测】★★★  连续播放路径：原图 → lights / armors。
+        processArmors(raw, light_detector, armor_detector, bin, lights, armors);  // 原图 → 灯条 + 装甲
+        // ★★★【整车 EKF】★★★  连续播放路径：dt=1/视频帧率，按视频时间预测。
+        runAim(frame_dt);  // dt=1/视频帧率，EKF 按视频时间预测，不按墙钟
         syncTrackbar();
         return true;
     };
 
+    // 主循环：先决定「要不要读新帧」，再把当前帧画出来，最后等键盘。
     while (true) {
         if (scrubber.seek) {
+            // 用户拖了 frame 进度条：回调只记下 want，真正跳帧放在这里（GTK 不允许在回调里 setTrackbarPos）。
             scrubber.seek = false;
-            paused = true;
-            grabAt(scrubber.want);
+            paused = true;           // 跳完停住，方便看这一帧
+            grabAt(scrubber.want);  // want = 进度条上的目标帧号
         } else if (!paused) {
+            // 未暂停：按视频顺序播下一帧；播完了就自动暂停。
             if (!grabNext())
                 paused = true;
             else
-                updateFps(fps, is_show_fps);
+                updateFps(fps, is_show_fps);  // 只在真正播出新帧时刷 FPS
         }
+        // paused==true 且没 seek：不读新帧，下面仍会把上一帧再画一遍（改 overlay 开关立刻能看见）。
 
         if (raw.empty() || current_frame.empty())
-            break;
+            break;  // 第一帧就读失败，或画面还没建立
 
-        Mat vis = current_frame.clone();
+        Mat vis = current_frame.clone();  // 在副本上画 overlay，不改 current_frame
         if (overlay_light) {
             for (auto& light : lights)
-                light.draw_light(vis);
+                light.draw_light(vis);  // 检测灯条框，和筛灯条用同一套几何
         }
         if (overlay_armor) {
             for (auto& armor : armors)
-                armor.draw_armor(vis);
+                armor.draw_armor(vis);  // 检测装甲四边形
         }
         if (overlay_dist && overlay_txt)
             drawArmorDistances(vis, armors);  // 读 ArmorBoard::dist_m；受 txt 总开关
@@ -404,34 +445,36 @@ int main(int argc, char** argv) {
                 armor.draw_normal(vis);  // 读 normal_cam
         }
         // txt=0 时 vel/hud 的 putText 关掉，hub（连线+ω箭头）/plates/aim 几何仍按各自开关画
+        // flags 五个开关：车心几何、预测板色块、预瞄十字、状态字、速度字
         const AimDrawFlags flags{overlay_hub != 0, overlay_plates != 0, overlay_aim != 0,
                                  overlay_hud != 0 && overlay_txt != 0,
                                  overlay_vel != 0 && overlay_txt != 0};
         aimer.draw(vis, aim_tgts, flags);  // 每辆车读自己的 AimTarget 像素
 
+        // 顶栏写 FPS 和本帧车辆数（= aim_tgts 条数），再缩到 1080p 窗口里
         Mat shown = scaleTo1080(makeDisplayCanvas(vis, is_show_fps ? fps : 0.0,
                                                   static_cast<int>(aim_tgts.size())),
                                 &display_scale,
                                 kDisplayTrackbars);
-        imshow(win_display, shown);
-        imshow(win_vis, makeVisLegend());
+        imshow(win_display, shown);       // 大窗：视频 + overlay
+        imshow(win_vis, makeVisLegend()); // 小窗：各进度条含义说明
 
-        const int key = waitKeyEx(15);
+        const int key = waitKeyEx(15);  // 最多等 15ms；没按键返回负数，画面照常刷新
         if (key < 0)
-            continue;
-        const int key8 = key & 0xFF;
+            continue;  // 没按键：进入下一圈（暂停时等于原地重画）
+        const int key8 = key & 0xFF;  // 取低 8 位，兼容 Esc/字母；方向键要用原始 key 判断
         if (key8 == 27 || key8 == 'q')
-            break;
+            break;  // Esc 或 q：退出播放
         if (key8 == '1')
-            is_show_fps = !is_show_fps;
+            is_show_fps = !is_show_fps;  // 顶栏 FPS 显示开/关
         if (key8 == ' ')
-            paused = !paused;
+            paused = !paused;  // 空格：播 / 停
         else if (isLeftKey(key)) {
             paused = true;
-            grabAt(shown_index - 1);
+            grabAt(shown_index - 1);  // a 或左方向：上一帧（内部会 reset EKF）
         } else if (isRightKey(key)) {
             paused = true;
-            grabAt(shown_index + 1);
+            grabAt(shown_index + 1);  // d 或右方向：下一帧（内部会 reset EKF）
         }
     }
 

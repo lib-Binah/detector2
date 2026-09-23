@@ -410,21 +410,26 @@ std::unique_ptr<EKFCore> VehicleTracker::makeNormalEKF(const int& active_phase_i
 
 /**
  * 作用：写入普通目标 Q/R 并重建核。输入：无。输出：model=Normal。
+ * 说明：init 锁普通车时调用。只准备噪声和公式，不写入 x 初值（那是 initEKF）。
  */
 void VehicleTracker::buildNormalModel() {
     model_ = Model::Normal;
     // lovod processor_config.yaml ekf.q / ekf.r
+    // 对角顺序与状态相同：[xc, yc, z1, z2, yaw, vx, vy, vz, vyaw, r1, r2]
+    // 注意：predict 实际用 makeProcessQ（yaml 的 q_acc/q_alpha 白噪声），不用下面这组对角去积 P。
+    //普通车过程噪声 Q 的对角默认值
     const std::vector<double> q_diag = {0.01, 0.01, 0.005, 0.005, 0.03, 0.01, 0.01, 0.005, 0.04, 0.001,
                                         0.001};
     Q_ = Eigen::MatrixXd::Identity(state_dim, state_dim);
     for (std::size_t i = 0; i < q_diag.size(); ++i)
         Q_(static_cast<int>(i), static_cast<int>(i)) = q_diag[i];
     // lovod odom 用 σ_xy≈5cm。相机系板心来自 PnP，σ 取 ~1cm 才能贴观测；yaml 若有 r 序列仍覆盖。
-    const std::vector<double> r_diag = {1e-4, 1e-4, 4e-4, 2.5e-3};
+    // 量测 4 维：(板x, 板y, 板z, 板yaw)，单位 m / rad。更新时还会加上 makeObservations 的视觉协方差。
+    const std::vector<double> r_diag = {1e-4, 1e-4, 4e-4, 2.5e-3};  // σ≈1cm, 1cm, 2cm, 0.05rad
     R_ = Eigen::MatrixXd::Identity(4, 4);
     for (std::size_t i = 0; i < r_diag.size(); ++i)
         R_(static_cast<int>(i), static_cast<int>(i)) = r_diag[i];
-    ekf_ = makeNormalEKF(confirmed_phase_idx_);
+    ekf_ = makeNormalEKF(confirmed_phase_idx_);  // 绑 f/h/H：圆周量测；过程只积当前相位那对高度
 }
 
 /**
@@ -515,38 +520,40 @@ Eigen::Vector4d VehicleTracker::measureArmor(const Eigen::VectorXd& x, int phase
 /**
  * 作用：锁车。前哨走 6 维；普通车先试 IPPE 双根 bootstrap。
  * 输入：选中的装甲指针。输出：DETECTING。
+ * 说明：Lost 时 step 调这里。只建初值，这一帧不 update。相位先当 0（看见的这块板）。
  */
 void VehicleTracker::init(TrackedArmor* armor) {
     if (armor == nullptr)
-        return;
-    tracked_armor_ = *armor;
-    tracked_id_ = armor->id;
-    tracked_type_ = armor->type;
-    last_time_ = armor->stamp;
+        return;  // selectTargetArmors 空列表时不会走到这里；防空指针
+    tracked_armor_ = *armor;          // 拷贝整块观测，后续 initEKF 读 selectedRoot
+    tracked_id_ = armor->id;          // CNN 数字：6=前哨三板，其余四板车
+    tracked_type_ = armor->type;      // 大小板，预测矩形用同一套物点宽高
+    last_time_ = armor->stamp;        // 下一帧 dt = stamp - last_time_
     last_yaw_ = 0.0;
-    armor_num_ = (tracked_id_ == 6) ? 3 : 4;
-    default_r_ = (tracked_id_ == 6) ? outpost_radius_ : params_.default_radius_m;
-    phase_offsets_ = getPhaseOffsets();
-    accelerate_window_.reset();
+    armor_num_ = (tracked_id_ == 6) ? 3 : 4;  // overlay / 选相环上有几块板
+    default_r_ = (tracked_id_ == 6) ? outpost_radius_ : params_.default_radius_m;  // 沿法线推车心的半径
+    phase_offsets_ = getPhaseOffsets();  // 四板 0/90/180/270°，前哨 0/120/240°
+    accelerate_window_.reset();      // 速度注入窗口，新车不能继承上一辆的样本
     resetZAccumulator();
     resetCenterYawObserver();
     resetOutpostState();
-    stop_evidence_armed_ = false;
-    state_ = VehicleTrackState::Detecting;
+    stop_evidence_armed_ = false;    // 高自旋停转检测，从零开始
+    state_ = VehicleTrackState::Detecting;  // 还没连续匹配够 tracking_threshold 帧
     detect_count_ = 0;
     lost_count_ = 0;
-    confirmed_phase_idx_ = 0;
-    hypothetic_phase_idx_ = -1;
+    confirmed_phase_idx_ = 0;        // 锁车这块板当相位 0；90° 邻板用另一对 z/r
+    hypothetic_phase_idx_ = -1;      // 尚未提出换相假设
     hypothetic_phase_count_ = 0;
     last_phase_change_time_ = armor->stamp;
     last_nis_ = 0.0;
     if (tracked_id_ == 6) {
-        buildOutpostModel();
-        initEKF(tracked_armor_);
+        buildOutpostModel();         // 6 维 [xc,yc,zc,yaw,vyaw,r]，r 固定
+        initEKF(tracked_armor_);     // 车心 = 板心 + r·(cos yaw, sin yaw)
     } else {
-        buildNormalModel();
+        buildNormalModel();          // 11 维 [xc,yc,z1,z2,yaw,vx,vy,vz,vyaw,r1,r2]
         if (startNormalBootstrap(tracked_armor_)) {
             // 双根尚未决胜时也用 0 号假设的车心给 overlay，避免 Detecting 画在原点。
+            // 锁俯仰后 pose_roots 只有一根，这里通常 false，落到下面的 initEKF。
             if (bootstrap_tracks_[0].ekf)
                 target_state_ = bootstrap_tracks_[0].ekf->getState();
             if (target_state_.x.size() >= state_dim) {
@@ -554,9 +561,9 @@ void VehicleTracker::init(TrackedArmor* armor) {
                 published_yc_ = target_state_.x(yc);
                 published_vyaw_ = target_state_.x(vyaw);
             }
-            return;
+            return;  // 主 ekf_ 还没 init；后续帧由 advanceBootstrap 决胜再提交
         }
-        initEKF(tracked_armor_);
+        initEKF(tracked_armor_);     // 单根：主 EKF 立刻有初值，z1=z2、r1=r2、速度为 0
     }
     last_phase_change_yaw_ = isOutpostTarget() ? target_state_.x(o_yaw) : target_state_.x(yaw);
     if (isOutpostTarget() && target_state_.x.size() >= o_state_dim) {
@@ -567,7 +574,7 @@ void VehicleTracker::init(TrackedArmor* armor) {
         published_xc_ = target_state_.x(xc);
         published_yc_ = target_state_.x(yc);
         published_vyaw_ = target_state_.x(vyaw);
-    }
+    }  // published_* 给 overlay 车心/ω；与滤波状态同源，禁止另算一套
 }
 
 /**
@@ -738,20 +745,21 @@ bool VehicleTracker::associateNormalArmors(const std::vector<TrackedArmor*>& arm
 }
 
 /**
- * 作用：车心 = 板心 + r·(cos yaw, sin yaw)，两对 z/r 先用同一高度和半径。
- * 输入：armor。输出：ekf_ 初值。
+ * 作用：由板到车写 EKF 初值。车心 = 板心 + r·(cos yaw, sin yaw)（h 的逆：板 = 车心 − r·(cosθ,sinθ)）；两对 z/r 先用同一高度和半径。
+ * 输入：armor（板心、板 yaw）。输出：ekf_ 初值（车心 xc/yc、yaw、r）。
  */
 void VehicleTracker::initEKF(const TrackedArmor& armor) {
-    const Eigen::Vector3d position = armor.selectedRoot().position;
+    const Eigen::Vector3d position = armor.selectedRoot().position;  // 选中根的板心 (xa,ya,za)
     const double xa = position.x();
     const double ya = position.y();
     const double za = position.z();
-    const double yaw_meas = getYawFromOrientation(armor);
-    const double r = (armor.id == 8) ? 0.0 : default_r_;
+    const double yaw_meas = getYawFromOrientation(armor);  // 这块板的 yaw；(cos,sin) 从板指向车内
+    const double r = (armor.id == 8) ? 0.0 : default_r_;  // 哨兵 r=0；否则沿法线推车心的默认半径
     dz_ = 0.0;
     za_ = za;
     if (isOutpostTarget()) {
         EKFCore::State initial_state(o_state_dim);
+        // 由板到车：车心 = 板心 + r·(cos yaw, sin yaw)。量测 h 是逆变换 板 = 车心 − r·(cosθ,sinθ)。
         const double xc0 = xa + r * std::cos(yaw_meas);
         const double yc0 = ya + r * std::sin(yaw_meas);
         initial_state.x << xc0, yc0, za, yaw_meas, 0.0, r;
@@ -761,9 +769,10 @@ void VehicleTracker::initEKF(const TrackedArmor& armor) {
         target_state_ = initial_state;
     } else {
         EKFCore::State initial_state(state_dim);
+        // 由板到车：车心 = 板心 + r·(cos yaw, sin yaw)。量测 h 是逆变换 板 = 车心 − r·(cosθ,sinθ)。
         const double xc0 = xa + r * std::cos(yaw_meas);
         const double yc0 = ya + r * std::sin(yaw_meas);
-        initial_state.x << xc0, yc0, za, za, yaw_meas, 0, 0, 0, 0, r, r;
+        initial_state.x << xc0, yc0, za, za, yaw_meas, 0, 0, 0, 0, r, r;  // 两对 z/r 先共用这块板
         // 位置/朝向 P 要大，首帧增益才够把四板贴到观测上；v/ω 也要大，否则永远从 0 爬。
         Eigen::VectorXd p0(state_dim);
         p0 << 1.0, 1.0, 1.0, 1.0, 0.4, 64.0, 64.0, 64.0, 100.0, 1.0, 1.0;
@@ -1860,46 +1869,48 @@ double VehicleTracker::computeAdaptiveGain(double v_old, double v_new, double ma
 /**
  * 作用：pnp_ok 板 → 跟踪系一根位姿（锁俯仰后只有一根，双根 bootstrap 自动跳过）。
  * 输入：检测装甲。输出：观测列表。
+ * 说明：检测器的 ArmorBoard 翻译成 EKF 能吃的 TrackedArmor，本身不算滤波。
+ *       后面选车、匹配相位、更新都读这份列表，不再直接读 ArmorBoard。
  */
 std::vector<VehicleTracker::TrackedArmor> VehicleTracker::makeObservations(
     const std::vector<ArmorBoard>& armors) const {
     std::vector<TrackedArmor> out;
-    const cv::Mat& K = ArmorBoard::cameraMatrix();
+    const cv::Mat& K = ArmorBoard::cameraMatrix();  // 内参，用来拿像主点 (cx,cy)
     double cx = 0.0;
     double cy = 0.0;
     if (K.rows >= 3 && K.cols >= 3) {
-        cx = K.at<double>(0, 2);
+        cx = K.at<double>(0, 2);  // 像主点像素，离它越近越优先被 selectTargetArmors 锁
         cy = K.at<double>(1, 2);
     }
     for (const auto& a : armors) {
         if (!a.pnp_ok || a.dist_m <= 0.0)
-            continue;
+            continue;  // 没解出位姿或距离无效：EKF 不能当观测
         TrackedArmor obs;
-        obs.stamp = time_s_;
-        obs.id = a.number;
+        obs.stamp = time_s_;           // 与 step 里累加的视频时间同一套
+        obs.id = a.number;             // CNN 数字，用来分车，不是相位 0/1/2/3
         obs.color = a.color();
-        obs.type = a.type;
+        obs.type = a.type;             // 大小板，后面预测板矩形用同一套物点
         obs.image_center = Eigen::Vector2d(a.center.x, a.center.y);
-        obs.distance_to_image_center = std::hypot(a.center.x - cx, a.center.y - cy);
+        obs.distance_to_image_center = std::hypot(a.center.x - cx, a.center.y - cy);  // 像素；选车用
         const cv::Point2f d0 = a.right_top - a.left_bottom;
         const cv::Point2f d1 = a.right_bottom - a.left_top;
-        obs.image_area = 0.5 * std::abs(d0.x * d1.y - d0.y * d1.x);
+        obs.image_area = 0.5 * std::abs(d0.x * d1.y - d0.y * d1.x);  // 平行四边形面积，加速收敛看板大小
         PoseRoot root;
-        const cv::Point3d mm = a.positionMm();
-        root.source_cam_mm = mm;
-        root.position = camToTrk(Eigen::Vector3d(mm.x / 1000.0, mm.y / 1000.0, mm.z / 1000.0));
-        root.yaw = armorYawTrk(a.normal_cam);
-        root.visual_covariance = Eigen::Matrix4d::Zero();
+        const cv::Point3d mm = a.positionMm();  // 相机系板心 mm，与 PnP tvec 同源，禁止另做 PnP
+        root.source_cam_mm = mm;                // 留相机系，给调试
+        root.position = camToTrk(Eigen::Vector3d(mm.x / 1000.0, mm.y / 1000.0, mm.z / 1000.0));  // mm→m，再变到前-左-上
+        root.yaw = armorYawTrk(a.normal_cam);  // 锁俯仰后的板法线 → 跟踪系水平 yaw
+        root.visual_covariance = Eigen::Matrix4d::Zero();  // 量测 (x,y,z,yaw) 的 R，对角写入下面
         const double e = std::max(a.reproj_error_px, 0.0);
         // 重投影只说明 PnP 质量。σ 不能放到厘米以上，否则 R 太大跟踪贴不住板。
-        const double pos_sigma = std::clamp(0.004 * (1.0 + 0.1 * e), 0.003, 0.012);
-        const double yaw_sigma = std::clamp(0.03 * (1.0 + 0.05 * e), 0.02, 0.06);
+        const double pos_sigma = std::clamp(0.004 * (1.0 + 0.1 * e), 0.003, 0.012);  // 位置 σ 约 3~12mm
+        const double yaw_sigma = std::clamp(0.03 * (1.0 + 0.05 * e), 0.02, 0.06);    // 朝向 σ 约 0.02~0.06rad
         const double pos_var = std::max(root_min_variance_, pos_sigma * pos_sigma);
         root.visual_covariance(0, 0) = pos_var;
         root.visual_covariance(1, 1) = pos_var;
         root.visual_covariance(2, 2) = pos_var;
         root.visual_covariance(3, 3) = std::max(root_min_variance_, yaw_sigma * yaw_sigma);
-        obs.pose_roots.push_back(root);
+        obs.pose_roots.push_back(root);  // 锁俯仰后只有一根；两根时 bootstrap 才走另一条路
         out.push_back(std::move(obs));
     }
     return out;
@@ -1909,38 +1920,45 @@ std::vector<VehicleTracker::TrackedArmor> VehicleTracker::makeObservations(
  * 作用：像心最近优先；已跟踪则粘滞 id，除非新目标近过 id_switch_factor 倍。最多留两块同号板。
  * Aimer 按号分桶后这里通常只有一个 number；混桶时仍只锁一辆，避免异号进同一 EKF。
  * 输入：本帧观测（可改 selected_root）。输出：指针，指向 frame_armors_ 里的元素。
+ * 说明：这里的 id 是装甲数字（3/4/英雄…），不是四板相位 0/1/2/3。本函数不更新 EKF。
+ *       step 里：Lost 且非空 → init(selected.front())；已跟踪 → update(selected)。
  */
 std::vector<VehicleTracker::TrackedArmor*> VehicleTracker::selectTargetArmors(
-    std::vector<TrackedArmor>& armors) {
+    std::vector<TrackedArmor>& armors)
+{
     std::vector<TrackedArmor*> selected;
     if (armors.empty())
-        return selected;
+        return selected;  // 本帧无板：step 走丢失，不会 init
+    // 像心最近优先：distance_to_image_center 是 makeObservations 里板心到主点的像素距离。
     auto best_it = std::min_element(armors.begin(), armors.end(),
                                     [](const TrackedArmor& lhs, const TrackedArmor& rhs) {
                                         return lhs.distance_to_image_center < rhs.distance_to_image_center;
                                     });
-    int selected_id = best_it->id;
+    int selected_id = best_it->id;  // Lost 时就锁画面最中间那辆的数字
     if (state_ != VehicleTrackState::Lost) {
+        // 已在跟某一辆：默认粘滞，避免画面边缘闪一下别的车就把锁抢走。
         const int tracked_id = tracked_id_;
         auto tracked_it = std::find_if(armors.begin(), armors.end(),
                                        [tracked_id](const TrackedArmor& armor) { return armor.id == tracked_id; });
+        // 换号仅当：本帧看不到旧号，或新目标比旧目标近过 id_switch_factor 倍（默认 1.5）。
+        // 例：旧号 200px、新号 80px → 80*1.5=120<200 换号；新号 150px → 150*1.5=225≮200 不换。
         const bool use_new_id =
             tracked_it == armors.end() ||
             (best_it->id != tracked_id &&
              best_it->distance_to_image_center * params_.id_switch_factor <
                  tracked_it->distance_to_image_center);
         if (!use_new_id)
-            selected_id = tracked_id;
+            selected_id = tracked_id;  // 继续跟原来那辆
     }
     for (TrackedArmor& armor : armors) {
         if (armor.id == selected_id)
-            selected.push_back(&armor);
+            selected.push_back(&armor);  // 只收同号；指针指向 frame_armors_，异号不进同一 EKF
     }
     std::sort(selected.begin(), selected.end(), [](const TrackedArmor* lhs, const TrackedArmor* rhs) {
         return lhs->distance_to_image_center < rhs->distance_to_image_center;
-    });
+    });  // front() = 这辆车里最靠近像心的板，Lost 时 init 用它
     if (selected.size() > 2)
-        selected.resize(2);
+        selected.resize(2);  // 一帧最多两块同号板（常见同时看见侧面两块）
     return selected;
 }
 
@@ -2080,12 +2098,15 @@ void VehicleTracker::step(const std::vector<ArmorBoard>& armors, double dt) {
         time_s_ += dt;
     frame_armors_ = makeObservations(armors);
     std::vector<TrackedArmor*> selected = selectTargetArmors(frame_armors_);
+    // Lost：还没锁车（新建或丢太久）。只允许 init，不能 update——没有可预测的状态。
+    // selected 非空：front() 是这辆车里最靠近像心的板，init 锁号、建 EKF，状态→Detecting。
+    // selected 为空：本帧无板，继续 Lost。return 避免落到下面的 update。
     if (state_ == VehicleTrackState::Lost) {
         if (!selected.empty())
             init(selected.front());
         return;
     }
-    update(selected, time_s_);
+    update(selected, time_s_);  // Detecting/Tracking/TempLost：有板则预测+量测，没板走丢失计数
 }
 
 std::vector<Eigen::Vector4d> VehicleTracker::armorXyza(const Eigen::VectorXd* x) const {
